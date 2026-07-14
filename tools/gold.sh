@@ -11,7 +11,7 @@ export DISPLAY="${DISPLAY:-:0}"
 d="$(mktemp -d)"; tmp="$d/cap.png"
 # graphics emits many pre-existing `not null` deprecation warnings; hide them,
 # but show loft's stderr if the run actually fails.
-if ! loft --interpret "$here/src/main.loft" "$tmp" >/dev/null 2>"$d/err"; then
+if ! loft --interpret "$here/src/main.loft" "$tmp" "$name" >/dev/null 2>"$d/err"; then
   cat "$d/err" >&2; echo "FAIL $name (loft run errored)"; exit 1
 fi
 gold="$here/golden/$name.png"
