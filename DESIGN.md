@@ -13,9 +13,16 @@ One installable native app that:
 - connects to the laptop's `sshd` (default port `42022`, configurable) — the
   **only** service the laptop needs to expose;
 - authenticates with a **password**, typed each session, **never stored**;
-- attaches `tmux` and renders it in a phone-width terminal;
-- (later) shows four panes — touch to switch, drag to scroll — with **speech**
-  to enter prompts into the active pane.
+- on connect, **auto-runs a configurable startup command** — default
+  `tmux attach`, so you land straight in the latest/last-used tmux session with
+  nothing to type — and renders tmux (with **mouse mode on**) faithfully in a
+  phone-width terminal;
+- lets **tmux own selection and scroll**: a tap forwards as a mouse click (tmux
+  selects that pane/window) and a drag/flick forwards as scroll (tmux copy-mode /
+  scrollback) — fully tmux-compatible, nothing reimplemented client-side;
+- takes **commands by speech**, injected as keystrokes into the currently
+  selected tmux pane/window. The on-screen keyboard is used only for the one-time
+  password (§5) — never for command entry.
 
 ## 2. Why pure-native (not a web page)
 
@@ -42,13 +49,19 @@ on the laptop and there is no relay in the middle.
 |---|---|---|
 | Terminal UI (grid render, panes, touch, scroll, speech) | **loft** | draws through `gl_*` + `gl_load_font` |
 | GL / windowing / font | **loft `lib/graphics`** | existing; native backend = glutin + winit + gl + fontdue |
-| SSH session logic (framing, `tmux -CC` parse, resize) | **loft** | new library in this repo |
+| Terminal emulator + SSH session (VT parse, mouse-event forwarding, resize) | **loft** | new library in this repo |
 | SSH transport | **Rust `russh` via loft FFI** | password auth; the "rust lib" |
 
-`tmux -CC` (control mode) is the mechanism for the four-pane UX: each pane is a
-structured `%output` stream, so the client renders each as its own full-width
-virtual screen and switches by touch — no attempt to squeeze four panes onto one
-phone-width grid.
+The four-part UX is **tmux's own**, not reimplemented. The app is a faithful VT
+emulator that renders tmux's screen with tmux `mouse on`, and forwards input to
+tmux: a **tap becomes an SGR mouse click** (tmux selects that pane/window) and a
+**drag/flick becomes scroll** (tmux enters copy-mode and scrolls history). So
+click-to-select and scrollback behave exactly as tmux does at a desktop — the
+goal the maintainer set. Using tmux **windows** (full-width, one visible, tap the
+status line to switch) keeps each part phone-width instead of tiling four tiny
+panes. On connect the app auto-runs the startup command (default `tmux attach`),
+so the latest session is already selected. (`tmux -CC` control mode stays a
+fallback if native mouse tiling proves too cramped.)
 
 ## 4. What loft already gives us
 
@@ -64,17 +77,22 @@ today and in a browser via `--html`, unchanged.
 - **Password auth only** in v1 (`russh` password method). No pubkey, no agent.
 - **No private key or password persisted** — the password lives in memory only
   for the handshake, is never written to disk/logs, and is re-entered each session.
-- Password is typed into the on-screen terminal (soft keyboard on Android).
-- Host/port configurable; default port `42022`.
+- Password is typed into the on-screen terminal (soft keyboard on Android). The
+  on-screen keyboard is used **only** for the password — never for commands (those
+  are spoken; a password must never be spoken).
+- Configurable, with these defaults: host, port `42022`, and the on-connect
+  **startup command** `tmux attach` (selects the latest session).
 
 ## 6. Staged plan
 
-1. **Linux-native v1** — `lib/graphics` on-screen terminal, password SSH via the
-   russh FFI lib, a single `tmux` pane. Runs `--native` on Linux; this proves the
-   entire shared stack with zero Android risk.
-2. **Panes + input** — `tmux -CC`, four virtual screens, touch-to-switch,
-   drag-to-scroll.
-3. **Speech** — recognized text injected as keystrokes into the active pane.
+1. **Linux-native v1** — `lib/graphics` terminal (faithful VT), password SSH via
+   the russh FFI lib, auto-run `tmux attach` on connect. Runs `--native` on Linux;
+   proves the whole shared stack with zero Android risk.
+2. **tmux mouse forwarding** — tap → SGR mouse click (select pane/window),
+   drag/flick → scroll (tmux copy-mode). Selection + scrollback are tmux-native.
+3. **Speech input** — recognized text injected as keystrokes into the selected
+   tmux pane/window. (On the Linux build, mouse/keyboard stand in for touch/speech
+   while iterating.)
 4. **Android re-target** — the same source, with the two gaps below closed.
 
 ## 7. Android gaps (separable; both on loft's roadmap)

@@ -3,8 +3,10 @@
 # ssh_home
 
 A **pure-loft SSH terminal for your phone.** Log into your home laptop over SSH,
-attach `tmux`, and drive it from a phone-width terminal — panes you switch by
-touch, scroll by drag, and (later) prompts you enter by speech.
+attach `tmux`, and drive it from a phone-width terminal. On connect it drops you
+straight into your latest tmux session; you **tap to select a window**, **drag to
+scroll** (tmux's own scrollback), and enter commands by **speech** into the
+selected window.
 
 It is written in [loft](https://github.com/loft-lang/loft) — dogfooding the
 language — with a small **Rust FFI library for the SSH transport**. The UI
@@ -18,14 +20,17 @@ target, as a native **Android** app — no browser, no WebView.
 - **No private key is ever stored on the device.** No key file, no agent, no
   keychain entry.
 - The password is typed into the **on-screen terminal** at connect time, held in
-  memory only for the SSH handshake, and never written to disk or logs.
-- Host and port are fully configurable (default port `42022`).
+  memory only for the SSH handshake, and never written to disk or logs. The
+  on-screen keyboard is used **only** for the password — never for commands (those
+  are spoken; a password must never be spoken).
+- Host, port (default `42022`), and the on-connect **startup command** (default
+  `tmux attach`) are all configurable.
 
 ## Status
 
 Early scaffolding — no code yet. See [DESIGN.md](DESIGN.md) for the architecture
-and the staged plan. **Linux-native, single on-screen terminal, password auth**
-is the first build target; Android is a later re-target of the same source.
+and the staged plan. **Linux-native, password auth, auto-attach to tmux** is the
+first build target; Android is a later re-target of the same source.
 
 ## Toolchain
 
