@@ -1,46 +1,141 @@
 // Copyright (c) 2026 Jurjen Stellingwerff
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //
-// ssh_home — PLAN Step 0: the golden-capture harness + the text primitive the
-// VT emulator will sit on.
+// ssh_home — PLAN Step 1: the cell grid — the terminal's shared state. The VT
+// emulator (Step 2) WRITES cells; `render_grid` READS them into a Canvas that is
+// save_png'd (deterministic, headless golden tests) and, in the live app,
+// uploaded to GL for display.
 //
-// Renders the frame into a CPU `Canvas` and `save_png`s it — deterministic
-// (fontdue/CPU raster, no GPU AA variance) and HEADLESS (no GL window, so goldens
-// need no display and don't hit the --native winit panic). This is the render
-// path the terminal grid will grow into; the live app will additionally upload
-// the same Canvas to GL for interactive display (Step 1+).
+// Rendering is the CPU-Canvas path proven in Step 0: per cell, fill the bg rect
+// and draw the glyph. (Per-cell draw_text is fine for the golden; a glyph atlas
+// is the perf path for the live terminal, later.)
 //
-// Arg 1 = output PNG (absolute → written verbatim). Arg 2 = scene: clear | ready.
-//
-//   loft src/main.loft /abs/out.png ready
+//   loft src/main.loft /abs/out.png [clear|ready|grid]
 use graphics;
 
-W = 256;
-H = 192;
 FONT = "../fonts/DejaVuSansMono.ttf";   // relative to the source dir (src/)
+BG = 0xFF101820;                         // default background (0xAARRGGBB)
+FG = 0xFFE8F0FF;                         // default foreground
 
-// Render one frame into a Canvas. Colours are 0xAARRGGBB (the Canvas convention).
-pub fn render(scene_name: text) -> Canvas {
-  cv = canvas(W, H, 0xFF101820);        // opaque dark slate
-  if scene_name == "clear" { return cv; }
-  font = gl_load_font(FONT);            // fontdue/CPU — no GL context needed
+// A terminal cell: a glyph + fg/bg colours. Attributes (bold, reverse, …) arrive
+// with the SGR handling in Step 2.
+struct Cell {
+  ch: character,
+  fg: integer,
+  bg: integer,
+}
+
+// A cols x rows grid (row-major) plus the font + cell metrics to rasterize it.
+struct Grid {
+  cols: integer,
+  rows: integer,
+  cell_w: integer,
+  cell_h: integer,
+  font: integer,
+  size: float,
+  cells: vector<Cell>,
+}
+
+// Build an all-blank grid sized to `cols` x `rows` at the font/size given.
+pub fn make_grid(font: integer, size: float, cols: integer, rows: integer) -> Grid {
+  g = Grid {
+    cols: cols,
+    rows: rows,
+    cell_w: gl_measure_text(font, "M", size) as integer,   // monospace advance
+    cell_h: gl_text_height(font, size),
+    font: font,
+    size: size,
+  };
+  g.cells = [for _ in 0..cols * rows { Cell { ch: ' ', fg: FG, bg: BG } }];
+  g
+}
+
+// Write one cell (bounds-checked). `&g.cells` is a writable alias so the element
+// write propagates back through the grid.
+pub fn grid_put(g: Grid, c: integer, r: integer, ch: character, fg: integer, bg: integer) {
+  if c >= 0 and c < g.cols and r >= 0 and r < g.rows {
+    gc = &g.cells;
+    gc[r * g.cols + c] = Cell { ch: ch, fg: fg, bg: bg };
+  }
+}
+
+// Write a string left-to-right starting at (c, r).
+pub fn grid_str(g: Grid, c: integer, r: integer, s: text, fg: integer, bg: integer) {
+  ps_i = 0;
+  for ps_ch in s {
+    grid_put(g, c + ps_i, r, ps_ch, fg, bg);
+    ps_i += 1;
+  }
+}
+
+// Rasterize the grid into a Canvas: per cell, fill the bg then draw the glyph.
+pub fn render_grid(g: const Grid) -> Canvas {
+  cv = canvas(g.cols * g.cell_w, g.rows * g.cell_h, BG);
+  rg_cells = g.cells;
+  for rg_r in 0..g.rows {
+    for rg_c in 0..g.cols {
+      cell = rg_cells[rg_r * g.cols + rg_c] ?? Cell { ch: ' ', fg: FG, bg: BG };
+      px = rg_c * g.cell_w;
+      py = rg_r * g.cell_h;
+      cv.fill_rect(px, py, g.cell_w, g.cell_h, cell.bg);
+      if cell.ch != ' ' {
+        cv.draw_text(g.font, "{cell.ch}", g.size, px, py, cell.fg);
+      }
+    }
+  }
+  cv
+}
+
+// A test pattern: a box border + text runs (one with a coloured background) —
+// exercises glyphs, per-cell fg, and per-cell bg in one golden.
+fn scene_grid(font: integer) -> Canvas {
+  cols = 22;
+  rows = 7;
+  g = make_grid(font, 24.0, cols, rows);
+  for bx in 0..cols {
+    grid_put(g, bx, 0, '-', FG, BG);
+    grid_put(g, bx, rows - 1, '-', FG, BG);
+  }
+  for by in 0..rows {
+    grid_put(g, 0, by, '|', FG, BG);
+    grid_put(g, cols - 1, by, '|', FG, BG);
+  }
+  grid_put(g, 0, 0, '+', FG, BG);
+  grid_put(g, cols - 1, 0, '+', FG, BG);
+  grid_put(g, 0, rows - 1, '+', FG, BG);
+  grid_put(g, cols - 1, rows - 1, '+', FG, BG);
+  grid_str(g, 3, 2, "ssh_home", 0xFF88E0FF, BG);
+  grid_str(g, 3, 4, "READY", FG, 0xFF204830);   // fg + coloured cell run
+  render_grid(g)
+}
+
+fn render(scene_name: text) -> Canvas {
+  if scene_name == "clear" {
+    return canvas(256, 192, BG);
+  }
+  font = gl_load_font(FONT);
   if font < 0 {
     println("ssh_home: font load failed ({FONT})");
-    return cv;
+    return canvas(256, 192, BG);
   }
-  cv.draw_text(font, "READY", 40.0, 16, 72, 0xFFE8F0FF);   // near-white
+  if scene_name == "grid" {
+    return scene_grid(font);
+  }
+  // "ready": the Step 0 single-line text scene.
+  cv = canvas(256, 192, BG);
+  cv.draw_text(font, "READY", 40.0, 16, 72, FG);
   cv
 }
 
 fn main() {
   args = arguments();
   if len(args) == 0 {
-    println("usage: main.loft <output.png> [clear|ready]");
+    println("usage: main.loft <output.png> [clear|ready|grid]");
     return;
   }
   out = args[0] ?? "";
   scene_name = if len(args) > 1 { args[1] ?? "clear" } else { "clear" };
   frame = render(scene_name);
-  if frame.save_png(out) { println("ssh_home 0.3: wrote {out} (scene={scene_name})"); }
-  else { println("ssh_home 0.3: save_png FAILED"); }
+  if frame.save_png(out) { println("ssh_home: wrote {out} (scene={scene_name})"); }
+  else { println("ssh_home: save_png FAILED"); }
 }
