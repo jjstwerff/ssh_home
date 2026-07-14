@@ -26,7 +26,35 @@ One installable native app that:
   so tmux reflows — bigger text simply means fewer columns;
 - takes **commands by speech**, injected as keystrokes into the currently
   selected tmux pane/window. The on-screen keyboard is used only for the one-time
-  password (§5) — never for command entry.
+  password (§5) — never for command entry;
+- makes **accepting an AI agent's prompt a single gesture** (§1a).
+
+### 1a. One-gesture accept (AI prompts)
+
+When an agent running in tmux (Claude Code, etc.) presents a choice, accepting
+its recommendation should not cost a soft-keyboard trip or a spoken "yes". The
+terminal stays a **dumb VT emulator — it never parses the agent's output** — and
+leans on the universal convention that a prompt **highlights its recommended
+option as the default and accepts it on Enter**:
+
+- **right-fling → `Enter`** (take the highlighted default — the agent's
+  recommendation whenever it follows that convention); **left-fling → `Esc`**
+  (back / decline). A *horizontal* fling is distinct from the *vertical*
+  drag/flick that scrolls, so the two never collide.
+- **tap the highlighted option** already works for any mouse-aware TUI via the
+  SGR mouse forwarding — the tap is a click the agent reads as "select this item".
+  So for mouse-aware agents there is nothing new to build.
+- optional, read off the emulator's own attribute grid: when a highlighted
+  (reverse-video) choice is on screen, show a small **`⏎ <option text>`** chip so
+  you see what you're about to accept; swipe up/down can move the highlight
+  (arrow keys) before accepting a non-default.
+
+Honest limit: the terminal can't know the agent's *semantic* recommendation
+without parsing it (fragile, agent-specific), so right-fling takes the **default**.
+When a prompt deliberately defaults to the safe choice against the agent's push
+(a destructive action defaulting to **No**), the fling takes that safe default —
+the desirable behavior. No semantic parsing is built; the convention covers the
+rest, and the terminal stays agent-agnostic.
 
 ## 2. Why pure-native (not a web page)
 

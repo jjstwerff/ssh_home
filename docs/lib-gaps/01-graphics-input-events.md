@@ -108,17 +108,26 @@ insertion) — mirroring winit's `KeyEvent{logical_key,text}` and the browser's
 
 ## Gestures (pure loft, on top — not a backend concern)
 
-Pinch/pan/tap are a **deterministic function of the ordered touch stream**, so
-they belong in portable loft, not in each backend. A small recognizer (shippable
-as a tiny `gesture` lib, or vendored in the app) consumes `EV_TOUCH_*`:
+Tap/pan/pinch/swipe are a **deterministic function of the ordered touch stream**,
+so they belong in portable loft, not in each backend. A small recognizer
+(shippable as a tiny `gesture` lib, or vendored in the app) consumes `EV_TOUCH_*`:
 
 - `Tap{x,y}` — down+up within space/time thresholds.
 - `Pan{dx,dy}` — one active touch moving.
 - `Pinch{scale,cx,cy}` — two touches; `scale = dist_now / dist_start`, centroid `(cx,cy)`.
+- `Swipe{dir,vx}` — one touch moving fast enough to cross a **velocity + distance**
+  threshold; `dir ∈ {left,right,up,down}`. Distinguished from `Pan` purely by
+  velocity — a slow move stays `Pan`.
+
+The recognizer only **classifies**; the action mapping is the consumer's. ssh_home
+maps a horizontal `Swipe{right}` → send `Enter` (accept an agent's highlighted
+default) and `Swipe{left}` → `Esc`, while vertical drag/scroll stays scroll — see
+that repo's DESIGN.md §1a "one-gesture accept".
 
 Because it's pure, it is **unit-testable with synthetic touch sequences — no
 window, no device.** Desktop, which has no touch, feeds the recognizer synthetic
-pinch from `Ctrl+wheel` at the app layer.
+pinch from `Ctrl+wheel` (and a horizontal `Swipe` from a fast `Shift+wheel` or a
+key) at the app layer.
 
 ## Verification (falsifiable)
 
@@ -131,4 +140,6 @@ pinch from `Ctrl+wheel` at the app layer.
   `EV_KEY_DOWN key='c' mods=MOD_CTRL`. On wasm, the same via headless-Chromium
   dispatching `KeyboardEvent`/`TouchEvent`. A dropped or reordered event fails.
 - **Gestures (pure loft unit):** feed a synthetic two-finger sequence → assert the
-  `Pinch.scale` series; a single down/up → `Tap`; no device needed.
+  `Pinch.scale` series; a single down/up → `Tap`; a **fast** horizontal drag →
+  `Swipe{right}`, and the **same path slower** → `Pan` (not `Swipe`) — pinning the
+  velocity threshold. No device needed.
