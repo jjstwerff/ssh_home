@@ -7,7 +7,6 @@
 set -euo pipefail
 name="${1:-clear}"
 here="$(cd "$(dirname "$0")/.." && pwd)"
-export DISPLAY="${DISPLAY:-:0}"
 d="$(mktemp -d)"; tmp="$d/cap.png"
 # graphics emits many pre-existing `not null` deprecation warnings; hide them,
 # but show loft's stderr if the run actually fails.

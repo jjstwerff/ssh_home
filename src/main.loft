@@ -4,13 +4,13 @@
 // ssh_home — PLAN Step 0: the golden-capture harness + the text primitive the
 // VT emulator will sit on.
 //
-// Opens a lib/graphics GL window, renders a frame, and `gl_screenshot`s it to the
-// PNG path in arg 1 (absolute → written verbatim). Arg 2 selects the scene_name:
-//   clear  — just the background (Step 0.1)
-//   ready  — background + "READY" in a bundled monospace font (Step 0.3)
-// Text goes through the graphics text-on-GL pipeline: create_text_texture
-// (draw_text → Canvas → gl_upload_canvas) then draw_texture_at, alpha-blended.
-// Needs a display; runs on DISPLAY=:0.
+// Renders the frame into a CPU `Canvas` and `save_png`s it — deterministic
+// (fontdue/CPU raster, no GPU AA variance) and HEADLESS (no GL window, so goldens
+// need no display and don't hit the --native winit panic). This is the render
+// path the terminal grid will grow into; the live app will additionally upload
+// the same Canvas to GL for interactive display (Step 1+).
+//
+// Arg 1 = output PNG (absolute → written verbatim). Arg 2 = scene: clear | ready.
 //
 //   loft src/main.loft /abs/out.png ready
 use graphics;
@@ -19,26 +19,17 @@ W = 256;
 H = 192;
 FONT = "../fonts/DejaVuSansMono.ttf";   // relative to the source dir (src/)
 
-fn draw_frame(scene_name: text) {
-  gl_clear(0x101820FF);                 // opaque dark slate (0xRRGGBBAA)
-  if scene_name == "clear" { return; }
-
-  painter = create_painter_2d(W as float, H as float);
-  font = gl_load_font(FONT);
-  if font < 0 { println("ssh_home: font load failed ({FONT})"); return; }
-
-  size = 40.0;
-  tex = create_text_texture(font, "READY", size, 0xFFE8F0FF);   // 0xAARRGGBB near-white
-  if tex == 0 { println("ssh_home: text texture failed"); return; }
-
-  // Match create_text_texture's canvas sizing (pad=2 → +5 wide, +4 tall) so the
-  // texture is drawn 1:1 (no scaling).
-  tw = gl_measure_text(font, "READY", size) as integer + 5;
-  th = gl_text_height(font, size) + 4;
-
-  gl_enable(graphics::GL_BLEND);
-  gl_blend_func(graphics::BLEND_SRC_ALPHA, graphics::BLEND_ONE_MINUS_SRC_ALPHA);
-  draw_texture_at(painter, tex, 16.0, 72.0, tw as float, th as float);
+// Render one frame into a Canvas. Colours are 0xAARRGGBB (the Canvas convention).
+pub fn render(scene_name: text) -> Canvas {
+  cv = canvas(W, H, 0xFF101820);        // opaque dark slate
+  if scene_name == "clear" { return cv; }
+  font = gl_load_font(FONT);            // fontdue/CPU — no GL context needed
+  if font < 0 {
+    println("ssh_home: font load failed ({FONT})");
+    return cv;
+  }
+  cv.draw_text(font, "READY", 40.0, 16, 72, 0xFFE8F0FF);   // near-white
+  cv
 }
 
 fn main() {
@@ -48,20 +39,8 @@ fn main() {
     return;
   }
   out = args[0] ?? "";
-  // Default to the working `clear` scene. The `ready` (text) scene is coded below
-  // but currently BLOCKED: draw_text→`loft_rasterize_text_into` is a bridgeless
-  // `vec_wrapper!` symbol (no interpreter marshal-bridge, same class as save_png),
-  // and --native panics in winit window creation. Both are graphics-lib/backend
-  // gaps to close (give those vec fns the n_*+bridge treatment like gl_upload_canvas).
   scene_name = if len(args) > 1 { args[1] ?? "clear" } else { "clear" };
-
-  if !gl_create_window(W, H, "ssh_home") {
-    println("ssh_home: no GL window (need a display)");
-    return;
-  }
-  draw_frame(scene_name);
-  ok = gl_screenshot(W, H, out);        // reads GL_BACK, before swap
-  gl_destroy_window();
-  if ok { println("ssh_home 0.3: wrote {out} (scene_name={scene_name})"); }
-  else { println("ssh_home 0.3: gl_screenshot FAILED"); }
+  frame = render(scene_name);
+  if frame.save_png(out) { println("ssh_home 0.3: wrote {out} (scene={scene_name})"); }
+  else { println("ssh_home 0.3: save_png FAILED"); }
 }
