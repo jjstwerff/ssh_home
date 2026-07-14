@@ -1,0 +1,22 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+.fuse_hidden*
+
+# Rust / loft build artifacts
+target/
+.loft/
+*.rlib
+*.so
+# loft per-library native cross-compile cache (generated on build; large .so)
+native-auto/
+
+# loft dep resolution lockfile (auto-written by `loft install`; regenerable)
+loft.lock
+
+# Local scratch / env
+scratch/
+.env
+.env.local
