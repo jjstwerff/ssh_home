@@ -20,3 +20,7 @@ loft.lock
 scratch/
 .env
 .env.local
+
+# Step 0 stray capture + path-dep lock
+src/out.png
+loft.lock

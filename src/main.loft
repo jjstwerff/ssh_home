@@ -1,0 +1,40 @@
+// Copyright (c) 2026 Jurjen Stellingwerff
+// SPDX-License-Identifier: LGPL-3.0-or-later
+//
+// ssh_home — PLAN Step 0: the golden-capture harness, proven on a trivial frame.
+//
+// Capture goes through the GL path: open a window, render, `gl_screenshot` the
+// framebuffer to a PNG. (The CPU `Canvas.save_png` path is headless but its
+// native symbol has no interpreter marshal-bridge and mis-marshals its
+// vector<integer> arg under --native — a graphics-lib gap, see loft-feedback;
+// `gl_screenshot` is the scalar-arg, bridge-backed path the gold tests use.)
+// Needs a display; runs on DISPLAY=:0.
+//
+// The output PNG path is the first program argument (ABSOLUTE, so it is written
+// verbatim — a relative path would resolve against the source dir). The golden
+// runner passes an explicit path; with no argument it does nothing.
+//
+//   loft src/main.loft /abs/out.png
+use graphics;
+
+W = 256;
+H = 192;
+
+fn main() {
+  args = arguments();
+  if len(args) == 0 {
+    println("usage: main.loft <output.png>  (absolute path)");
+    return;
+  }
+  out = args[0] ?? "";
+  if !gl_create_window(W, H, "ssh_home") {
+    println("ssh_home 0.1: no GL window (need a display)");
+    return;
+  }
+  gl_clear(0x101820FF);                  // opaque dark slate (0xRRGGBBAA)
+  // Step 1 renders the terminal grid here, before the screenshot.
+  ok = gl_screenshot(W, H, out);         // reads GL_BACK, before swap
+  gl_destroy_window();
+  if ok { println("ssh_home 0.1: wrote {out} ({W}x{H})"); }
+  else { println("ssh_home 0.1: gl_screenshot FAILED"); }
+}

@@ -1,0 +1,16 @@
+[package]
+name = "ssh_home"
+version = "0.0.0"
+loft = ">=0.8"
+
+# A pure-loft native terminal (PLAN.md). Rendering goes through loft's graphics
+# library's CPU Canvas (deterministic + headless for golden tests; the live app
+# uploads the same Canvas to GL). The input-event queue this app needs lands in
+# graphics 0.4.0 (Gap 01) — Step 0 only needs the Canvas + text primitives, so
+# >=0.3 is enough here; bump to >=0.4 at PLAN Step 2.
+[dependencies]
+# TODO: switch to `graphics = ">=0.4"` once the registry CDN propagates 0.4.0
+# (just published). Local dev uses a path dep on the freshly-built 0.4.0 (it has
+# the marshal-bridge for save_png + the Gap-01 input-event queue; the installed
+# 0.3.0 cdylib predates the bridge).
+graphics = { path = "../loft-libs-graphics/graphics" }
