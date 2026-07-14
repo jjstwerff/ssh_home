@@ -9,8 +9,7 @@ loft = ">=0.8"
 # graphics 0.4.0 (Gap 01) — Step 0 only needs the Canvas + text primitives, so
 # >=0.3 is enough here; bump to >=0.4 at PLAN Step 2.
 [dependencies]
-# TODO: switch to `graphics = ">=0.4"` once the registry CDN propagates 0.4.0
-# (just published). Local dev uses a path dep on the freshly-built 0.4.0 (it has
-# the marshal-bridge for save_png + the Gap-01 input-event queue; the installed
-# 0.3.0 cdylib predates the bridge).
-graphics = { path = "../loft-libs-graphics/graphics" }
+# graphics 0.4.1: the Gap-01 input-event queue + the save_png/rasterize bridges,
+# the Canvas write-propagation fix (&self.data), and the --native window fix that
+# Step 0's text rendering needs.
+graphics = ">=0.4.1"
