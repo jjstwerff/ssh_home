@@ -121,6 +121,12 @@ today and in a browser via `--html`, unchanged.
    surface, GLES-3.0 subset. Because the stack is already winit-based, this is a
    port, not a rewrite.
 
+Building v1 surfaced a third, cross-target lib gap: `lib/graphics` input is
+keycode-**polling** (no Unicode/IME text, no key-repeat, no multitouch), which a
+terminal and the pinch gesture need. Concrete designs for closing all of these in
+the existing libraries are in **[docs/lib-gaps/](docs/lib-gaps/)** — an input-event
+queue (Gap 01) and the Android target + EGL backend (Gap 02).
+
 ## 8. Honest "not fully pure" leaks on Android
 
 - **Speech** — Android's `SpeechRecognizer` is a Java API. Pure options: bundle a
