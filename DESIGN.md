@@ -20,6 +20,10 @@ One installable native app that:
 - lets **tmux own selection and scroll**: a tap forwards as a mouse click (tmux
   selects that pane/window) and a drag/flick forwards as scroll (tmux copy-mode /
   scrollback) — fully tmux-compatible, nothing reimplemented client-side;
+- supports **two-finger pinch zoom** to resize text on demand, starting from a
+  readable **DPI-aware default** (phone screens are hard to read). Zoom is a real
+  terminal resize: each step re-derives cols×rows and sends a PTY window-change,
+  so tmux reflows — bigger text simply means fewer columns;
 - takes **commands by speech**, injected as keystrokes into the currently
   selected tmux pane/window. The on-screen keyboard is used only for the one-time
   password (§5) — never for command entry.
@@ -89,8 +93,9 @@ today and in a browser via `--html`, unchanged.
 - Password is typed into the on-screen terminal (soft keyboard on Android). The
   on-screen keyboard is used **only** for the password — never for commands (those
   are spoken; a password must never be spoken).
-- Configurable, with these defaults: host, port `42022`, and the on-connect
-  **startup command** `tmux attach` (selects the latest session).
+- Configurable, with these defaults: host, port `42022`, the on-connect
+  **startup command** `tmux attach` (selects the latest session), and a readable
+  **DPI-aware default text size** (pinch to zoom from there).
 
 ## 6. Staged plan
 

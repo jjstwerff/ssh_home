@@ -6,7 +6,8 @@ A **pure-loft SSH terminal for your phone.** Log into your home laptop over SSH,
 attach `tmux`, and drive it from a phone-width terminal. On connect it drops you
 straight into your latest tmux session; you **tap to select a window**, **drag to
 scroll** (tmux's own scrollback), and enter commands by **speech** into the
-selected window.
+selected window. **Pinch to zoom** the text for readability — it starts at a
+comfortably large, screen-density-aware default.
 
 It is written in [loft](https://github.com/loft-lang/loft) — dogfooding the
 language — with a small **Rust FFI library for the SSH transport**. The UI
@@ -23,8 +24,8 @@ target, as a native **Android** app — no browser, no WebView.
   memory only for the SSH handshake, and never written to disk or logs. The
   on-screen keyboard is used **only** for the password — never for commands (those
   are spoken; a password must never be spoken).
-- Host, port (default `42022`), and the on-connect **startup command** (default
-  `tmux attach`) are all configurable.
+- Host, port (default `42022`), the on-connect **startup command** (default
+  `tmux attach`), and the **default text size** are all configurable.
 
 ## Status
 
