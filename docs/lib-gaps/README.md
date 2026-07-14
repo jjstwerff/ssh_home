@@ -2,22 +2,29 @@
 
 # Library gap designs
 
-ssh_home is a pure-loft app built on loft's `lib/graphics`. Building it surfaces
-gaps in that existing library (and in the loft toolchain). Each gap here is a
-**design proposal to `loft-lang/loft`** — drafted from the consumer side that hit
-it, in the spirit of the repo's dogfooding loop (loft store/engine requests are
-filed as issues on `loft-lang/loft`; this repo is the test-bed).
+ssh_home is a pure-loft app on loft's `lib/graphics`. Building it surfaced gaps in
+loft's existing libraries and toolchain. These are being **closed** inside
+`loft-lang` (where we have commit rights), not just filed as wishes:
 
-ssh_home v1 (Linux) is designed to **work around** these gaps (see [../../PLAN.md](../../PLAN.md));
-these designs are what makes the *Android* target and the *full* interaction model
-land cleanly, and they benefit every loft app that needs text input or touch.
+- **Gap 01 — `lib/graphics` input** → implemented in `loft-lang/loft-libs-graphics`.
+  The keycode-**polling** input model can't carry a terminal (or an Android soft
+  keyboard): no Unicode/IME text, no key-repeat, no per-event modifiers, several
+  named keys unmapped, no multitouch. Design + invariant:
+  [01-graphics-input-events.md](01-graphics-input-events.md).
 
-| # | Gap | Existing lib affected | Proposal |
-|---|---|---|---|
-| 01 | Keyboard is keycode-polling only — no Unicode/IME text, no key-repeat, no per-event modifiers, several named keys unmapped; and touch collapses to a single mouse (no multitouch) | `lib/graphics` (both native + wasm backends) | [01-graphics-input-events.md](01-graphics-input-events.md) |
-| 02 | No Android build target; `lib/graphics` has no Android windowing/GL backend | loft toolchain + `lib/graphics` | [02-android-target-and-backend.md](02-android-target-and-backend.md) |
+- **Gap 02 — Android** splits into two pieces:
+  - **Build target** = loft **compiler** work → a concrete, implementation-ready
+    handoff for the loft agent:
+    [../loft-compiler/android-build-target.md](../loft-compiler/android-build-target.md).
+  - **`lib/graphics` EGL/`ANativeWindow` backend** → `loft-lang/loft-libs-graphics`;
+    design in [02-android-target-and-backend.md](02-android-target-and-backend.md)
+    Part B; blocked on the build target.
 
-Both are grounded in the current code (`../loft/tests/fixtures/libs/graphics`):
-`gl_key_pressed(keycode)`/`gl_mouse_*` polling, the winit `key_index` map
-(`native/src/lib.rs`), the `KEY_*` block (`src/graphics.loft`), and the wasm
-`loft-gl.js` input shim.
+Separately, **SSH transport is a new library** in `loft-lang/loft-libs-net`
+(alongside `web`/`server`) — not a gap in an existing lib, but tracked with this
+work. See [../../PLAN.md](../../PLAN.md) Step 4.
+
+ssh_home v1 (Linux) works around whatever isn't ready yet (see PLAN.md). Each design
+states one load-bearing **invariant** and a **falsifiable** test. Grounded in the
+real code: `loft-libs-graphics/graphics` (the `gl_*` API + winit backend + `loft-gl.js`
+shim) and `loft-libs-net/web` (the `#native` FFI pattern the SSH lib mirrors).
