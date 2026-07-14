@@ -63,6 +63,15 @@ panes. On connect the app auto-runs the startup command (default `tmux attach`),
 so the latest session is already selected. (`tmux -CC` control mode stays a
 fallback if native mouse tiling proves too cramped.)
 
+**Scope consequence:** the app therefore carries **no tmux-specific code** — it is
+a generic SSH terminal emulator. tmux (or vim, htop, anything mouse-aware) works
+because the emulator honors the standard mouse-tracking modes the remote enables
+(DECSET `1000`/`1002`/`1006`) and emits SGR mouse events back, and resizes the PTY
+on layout change — all ordinary terminal behavior. The only tmux-shaped thing in
+the app is the default startup string (`tmux attach`), a configurable value, not
+logic. So the bulk of v1 is a **correct-enough VT emulator** (ANSI parser + a cell
+grid via `gl_load_font`); SSH and input forwarding are thin layers around it.
+
 ## 4. What loft already gives us
 
 loft's `lib/graphics` **is** the GL abstraction this needs, and it already runs
