@@ -109,6 +109,44 @@ fn scene_grid(font: integer) -> Canvas {
   render_grid(g)
 }
 
+// --- Step 1.2: geometry (cols×rows from window ÷ cell) + DPI-aware default ---
+
+// Monospace cell metrics for a font at a size.
+pub fn cell_w_for(font: integer, size: float) -> integer { gl_measure_text(font, "M", size) as integer }
+pub fn cell_h_for(font: integer, size: float) -> integer { gl_text_height(font, size) }
+
+// How many whole cols × rows fit a `win_w` × `win_h` pixel window. Zero cell
+// size (a failed font) yields 0×0 rather than a divide-by-zero.
+pub fn grid_cols_rows(win_w: integer, win_h: integer, cell_w: integer, cell_h: integer) -> (integer, integer) {
+  cols = if cell_w > 0 { win_w / cell_w } else { 0 };
+  rows = if cell_h > 0 { win_h / cell_h } else { 0 };
+  (cols, rows)
+}
+
+// DPI-aware default font size: a readable base scaled by display density. Phone
+// screens are hard to read (DESIGN §1), so the base is generous; the live app
+// passes the real display scale, headless tests pass 1.0.
+pub fn default_font_size(dpi_scale: float) -> float {
+  18.0 * dpi_scale
+}
+
+// A grid sized to fill a `win_w` × `win_h` window at the given font/size.
+pub fn make_grid_for_window(font: integer, size: float, win_w: integer, win_h: integer) -> Grid {
+  (fw_cols, fw_rows) = grid_cols_rows(win_w, win_h, cell_w_for(font, size), cell_h_for(font, size));
+  make_grid(font, size, fw_cols, fw_rows)
+}
+
+// Fill a 320×240 window at `size`; the derived grid dims scale with the size, so
+// two sizes give two goldens of different dimensions.
+fn scene_fit(font: integer, size: float) -> Canvas {
+  g = make_grid_for_window(font, size, 320, 240);
+  grid_str(g, 0, 0, "cols={g.cols} rows={g.rows}", 0xFF88E0FF, BG);
+  for ft_r in 1..g.rows {
+    grid_str(g, 0, ft_r, "{ft_r}", FG, BG);
+  }
+  render_grid(g)
+}
+
 fn render(scene_name: text) -> Canvas {
   if scene_name == "clear" {
     return canvas(256, 192, BG);
@@ -120,6 +158,12 @@ fn render(scene_name: text) -> Canvas {
   }
   if scene_name == "grid" {
     return scene_grid(font);
+  }
+  if scene_name == "fita" {
+    return scene_fit(font, 20.0);
+  }
+  if scene_name == "fitb" {
+    return scene_fit(font, 32.0);
   }
   // "ready": the Step 0 single-line text scene.
   cv = canvas(256, 192, BG);
@@ -135,6 +179,21 @@ fn main() {
   }
   out = args[0] ?? "";
   scene_name = if len(args) > 1 { args[1] ?? "clear" } else { "clear" };
+
+  // (U) geometry unit assertions — no image, just pass/fail.
+  if scene_name == "geomtest" {
+    (c1, r1) = grid_cols_rows(320, 240, 16, 32);
+    assert(c1 == 20);              // 320/16
+    assert(r1 == 7);               // 240/32 = 7.5 → 7
+    (c2, r2) = grid_cols_rows(256, 192, 14, 28);
+    assert(c2 == 18);              // 256/14 = 18.28 → 18
+    assert(r2 == 6);               // 192/28 = 6.85 → 6
+    (c3, r3) = grid_cols_rows(100, 100, 0, 0);
+    assert(c3 == 0 and r3 == 0);   // zero cell size → no divide-by-zero
+    println("geomtest: PASS");
+    return;
+  }
+
   frame = render(scene_name);
   if frame.save_png(out) { println("ssh_home: wrote {out} (scene={scene_name})"); }
   else { println("ssh_home: save_png FAILED"); }
