@@ -9,7 +9,8 @@ loft = ">=0.8"
 # graphics 0.4.0 (Gap 01) — Step 0 only needs the Canvas + text primitives, so
 # >=0.3 is enough here; bump to >=0.4 at PLAN Step 2.
 [dependencies]
-# graphics 0.4.1: the Gap-01 input-event queue + the save_png/rasterize bridges,
-# the Canvas write-propagation fix (&self.data), and the --native window fix that
-# Step 0's text rendering needs.
-graphics = ">=0.4.1"
+# graphics 0.4.2: the Gap-01 input-event queue + the save_png/rasterize bridges,
+# the Canvas write-propagation fix (&self.data), the --native window fix, and the
+# loft 2026.7.1 warning cleanup (retired `not null` removed, sqrt `float?` and the
+# group_vbos `&` params discharged) so consuming it stays warning-free.
+graphics = ">=0.4.2"
