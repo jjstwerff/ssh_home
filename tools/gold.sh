@@ -8,8 +8,8 @@ set -euo pipefail
 name="${1:-clear}"
 here="$(cd "$(dirname "$0")/.." && pwd)"
 d="$(mktemp -d)"; tmp="$d/cap.png"
-# graphics emits many pre-existing `not null` deprecation warnings; hide them,
-# but show loft's stderr if the run actually fails.
+# hide native cdylib build/rebuild noise on stdout/stderr, but surface loft's
+# stderr if the run actually fails. (graphics >=0.4.2 is warning-clean.)
 if ! loft --interpret "$here/src/main.loft" "$tmp" "$name" >/dev/null 2>"$d/err"; then
   cat "$d/err" >&2; echo "FAIL $name (loft run errored)"; exit 1
 fi

@@ -150,6 +150,123 @@ fn scene_fit(font: integer, size: float) -> Canvas {
   render_grid(g)
 }
 
+// --- Step 2.1: VT/ANSI emulator — text + C0 + DECAWM deferred wrap ---
+//
+// The emulator is a pure state machine: `term_feed` consumes a char stream and
+// mutates a `Term` (cursor + current colours + the DECAWM latch + the shared
+// Grid). The one load-bearing invariant is the DEFERRED WRAP: a glyph written in
+// the last column does NOT push the cursor off-screen — it latches `wrap_next`,
+// and the *next* printable consumes the latch (wrap→write). So exactly `cols`
+// glyphs fill a row with no premature blank line; glyph cols+1 wraps. Every cursor
+// move clears the latch, and `term_move` is the single chokepoint that guarantees
+// it. (Input is `text` here; the SSH path decodes PTY bytes→chars before feeding —
+// Step 4.)
+
+struct Term {
+  grid: Grid,
+  cx: integer,          // cursor column (0-based)
+  cy: integer,          // cursor row (0-based)
+  fg: integer,          // current SGR foreground (SGR parsing arrives in 2.3)
+  bg: integer,          // current SGR background
+  wrap_next: boolean,   // DECAWM deferred-wrap latch
+}
+
+pub fn term_new(grid: Grid) -> Term {
+  Term { grid: grid, cx: 0, cy: 0, fg: FG, bg: BG, wrap_next: false }
+}
+
+fn clampi(v: integer, lo: integer, hi: integer) -> integer {
+  if v < lo { lo } else if v > hi { hi } else { v }
+}
+
+// The cursor chokepoint: every non-printing cursor move routes through here, so
+// the DECAWM latch is cleared in exactly one place — no op can forget it.
+pub fn term_move(t: Term, cx: integer, cy: integer) {
+  t.cx = clampi(cx, 0, t.grid.cols - 1);
+  t.cy = clampi(cy, 0, t.grid.rows - 1);
+  t.wrap_next = false;
+}
+
+// Next 8-column tab stop (classic HT behaviour).
+fn next_tab(cx: integer) -> integer {
+  q = cx / 8 ?? 0;      // discharge the fallible `/` (DN1 types it `integer?`)
+  (q + 1) * 8
+}
+
+// Scroll the grid up one row; blank the new bottom row with `blank`.
+fn grid_scroll_up(g: Grid, blank: Cell) {
+  gc = &g.cells;
+  for r in 0..g.rows - 1 {
+    for c in 0..g.cols {
+      gc[r * g.cols + c] = gc[(r + 1) * g.cols + c];   // copy row r+1 → r
+    }
+  }
+  lr = g.rows - 1;
+  for c in 0..g.cols {
+    gc[lr * g.cols + c] = blank;
+  }
+}
+
+// LF / index: move down one row, scrolling if already at the bottom. Column is
+// unchanged (raw PTY LF); CR is what resets the column.
+fn term_linefeed(t: Term) {
+  if t.cy >= t.grid.rows - 1 {
+    grid_scroll_up(t.grid, Cell { ch: ' ', fg: t.fg, bg: t.bg });
+  } else {
+    t.cy += 1;
+  }
+  t.wrap_next = false;
+}
+
+// Print one glyph at the cursor, honouring the deferred wrap, then advance.
+fn term_put_ch(t: Term, ch: character) {
+  if t.wrap_next {
+    t.cx = 0;
+    term_linefeed(t);          // down (+scroll); clears wrap_next
+  }
+  grid_put(t.grid, t.cx, t.cy, ch, t.fg, t.bg);
+  if t.cx >= t.grid.cols - 1 {
+    t.wrap_next = true;        // at the right margin: latch instead of advancing
+  } else {
+    t.cx += 1;
+  }
+}
+
+// Feed a char stream: dispatch C0 controls, else print. (CSI/SGR: 2.2/2.3.)
+pub fn term_feed(t: Term, s: text) {
+  for fc in s {
+    cp = fc as integer;
+    if cp == 0x0A { term_linefeed(t); }                        // LF
+    else if cp == 0x0D { term_move(t, 0, t.cy); }              // CR
+    else if cp == 0x08 { term_move(t, t.cx - 1, t.cy); }       // BS
+    else if cp == 0x09 { term_move(t, next_tab(t.cx), t.cy); } // HT
+    else if cp >= 0x20 { term_put_ch(t, fc); }                 // printable
+    // remaining C0 (0x00–0x1F) are ignored until later sub-steps
+  }
+}
+
+// A grid with no font metrics — for model tests that assert state without rendering.
+fn make_grid_bare(cols: integer, rows: integer) -> Grid {
+  g = Grid { cols: cols, rows: rows, cell_w: 0, cell_h: 0, font: -1, size: 0.0 };
+  g.cells = [for _ in 0..cols * rows { Cell { ch: ' ', fg: FG, bg: BG } }];
+  g
+}
+
+fn term_ch_at(t: const Term, c: integer, r: integer) -> character {
+  cell = t.grid.cells[r * t.grid.cols + c] ?? Cell { ch: ' ', fg: FG, bg: BG };
+  cell.ch
+}
+
+// A render golden: CRLF text + a tab + a line that DECAWM-wraps past the margin.
+fn scene_vt(font: integer) -> Canvas {
+  t = term_new(make_grid(font, 24.0, 22, 7));
+  term_feed(t, "ssh_home vt\r\n");
+  term_feed(t, "line two\r\n");
+  term_feed(t, "tab:\tX\r\n");
+  term_feed(t, "wrap: this line is wider than the grid");
+  render_grid(t.grid)
+}
+
 fn render(scene_name: text) -> Canvas {
   if scene_name == "clear" {
     return canvas(256, 192, BG);
@@ -167,6 +284,9 @@ fn render(scene_name: text) -> Canvas {
   }
   if scene_name == "fitb" {
     return scene_fit(font, 32.0);
+  }
+  if scene_name == "vt" {
+    return scene_vt(font);
   }
   // "ready": the Step 0 single-line text scene.
   cv = canvas(256, 192, BG);
@@ -194,6 +314,51 @@ fn main() {
     (c3, r3) = grid_cols_rows(100, 100, 0, 0);
     assert(c3 == 0 and r3 == 0);   // zero cell size → no divide-by-zero
     println("geomtest: PASS");
+    return;
+  }
+
+  // (U) VT emulator model assertions — feed char fixtures, assert cursor + cells.
+  if scene_name == "vttest" {
+    bs = 8 as character;   // BS (0x08); loft string literals have no `\b` escape
+
+    // CRLF: LF moves down (keeps column), CR resets the column.
+    t = term_new(make_grid_bare(10, 4));
+    term_feed(t, "AB\r\nC");
+    assert(term_ch_at(t, 0, 0) == 'A' and term_ch_at(t, 1, 0) == 'B');
+    assert(term_ch_at(t, 0, 1) == 'C');
+    assert(t.cx == 1 and t.cy == 1);
+
+    // DECAWM deferred wrap on a 3-wide grid: last column fills, overflow wraps.
+    t2 = term_new(make_grid_bare(3, 3));
+    term_feed(t2, "ABCD");
+    assert(term_ch_at(t2, 2, 0) == 'C');     // C fills the last column (no early wrap)
+    assert(term_ch_at(t2, 0, 1) == 'D');     // D wraps to the next row
+    assert(t2.cx == 1 and t2.cy == 1);
+
+    // Exactly `cols` glyphs fill the row with the cursor latched (no newline yet).
+    t3 = term_new(make_grid_bare(3, 3));
+    term_feed(t3, "XYZ");
+    assert(term_ch_at(t3, 2, 0) == 'Z' and t3.cy == 0);
+    term_feed(t3, "W");
+    assert(term_ch_at(t3, 0, 1) == 'W' and t3.cy == 1);
+
+    // BS moves left; the next glyph overwrites.
+    t4 = term_new(make_grid_bare(10, 2));
+    term_feed(t4, "AB{bs}C");
+    assert(term_ch_at(t4, 1, 0) == 'C' and t4.cx == 2);
+
+    // HT advances to the next 8-column tab stop.
+    t5 = term_new(make_grid_bare(20, 2));
+    term_feed(t5, "A\tB");
+    assert(term_ch_at(t5, 8, 0) == 'B');
+
+    // LF on the bottom row scrolls the screen up.
+    t6 = term_new(make_grid_bare(3, 2));
+    term_feed(t6, "A\r\nB\r\nC");
+    assert(term_ch_at(t6, 0, 0) == 'B');     // B scrolled up from row 1
+    assert(term_ch_at(t6, 0, 1) == 'C');     // C on the new bottom row
+    assert(t6.cy == 1);
+    println("vttest: PASS");
     return;
   }
 
