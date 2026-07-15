@@ -1,0 +1,7 @@
+[?1049h[22;0;0t[?1h=fn main() {[m
+    let x = 42;[m
+    print(x);[m
+}[m
+line five[m
+line six[m
+[7mcorpus_src.txt (END)[27m[K[K

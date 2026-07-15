@@ -481,37 +481,57 @@ fn csi_dispatch(t: Term, final: character, params: vector<integer>) {
   // unrecognized finals ignored
 }
 
-// Feed a char stream through the escape parser: ground → C0/print, else an
+// The escape parser core, driven per codepoint: ground → C0/print, else an
 // `ESC [ … final` CSI. Parser state lives on the Term, so a sequence may span
-// feed chunks. (The SSH path decodes PTY bytes→chars before feeding — Step 4.)
-pub fn term_feed(t: Term, s: text) {
-  for fc in s {
-    cp = fc as integer;
-    if t.pstate == 0 {                                       // GROUND
-      if cp == 0x1B { t.pstate = 1; }                        // ESC
-      else if cp == 0x0A { term_linefeed(t); }               // LF
-      else if cp == 0x0D { term_move(t, 0, t.cy); }          // CR
-      else if cp == 0x08 { term_move(t, t.cx - 1, t.cy); }   // BS
-      else if cp == 0x09 { term_move(t, next_tab(t.cx), t.cy); } // HT
-      else if cp >= 0x20 { term_put_ch(t, fc); }             // printable
-    } else if t.pstate == 1 {                                // after ESC
-      if cp == 0x5B { t.pstate = 2; t.params = []; t.pcur = 0; t.priv = false; }  // '[' → CSI
-      else if cp == 0x44 { term_linefeed(t); t.pstate = 0; }      // ESC D = IND
-      else if cp == 0x4D { term_rev_index(t); t.pstate = 0; }     // ESC M = RI
-      else { t.pstate = 0; }                                 // other ESC seqs: later
-    } else {                                                 // CSI: params → final
-      if cp == 0x1B { t.pstate = 1; }                        // ESC aborts + restarts
-      else if cp == 0x3F { t.priv = true; }                  // '?' DEC private marker
-      else if cp >= 0x30 and cp <= 0x39 { t.pcur = t.pcur * 10 + (cp - 0x30); }  // digit
-      else if cp == 0x3B { t.params += [t.pcur]; t.pcur = 0; }                   // ';'
-      else if cp >= 0x40 and cp <= 0x7E {                    // final byte
-        t.params += [t.pcur];
-        csi_dispatch(t, fc, t.params);
-        t.pstate = 0;
-      }
-      // intermediates / private markers ('?') are ignored in 2.2
+// feed chunks. `fc` is the character to print (== `cp as character` for bytes).
+fn term_feed_cp(t: Term, cp: integer, fc: character) {
+  if t.pstate == 0 {                                         // GROUND
+    if cp == 0x1B { t.pstate = 1; }                          // ESC
+    else if cp == 0x0A { term_linefeed(t); }                 // LF
+    else if cp == 0x0D { term_move(t, 0, t.cy); }            // CR
+    else if cp == 0x08 { term_move(t, t.cx - 1, t.cy); }     // BS
+    else if cp == 0x09 { term_move(t, next_tab(t.cx), t.cy); } // HT
+    else if cp >= 0x20 { term_put_ch(t, fc); }               // printable
+  } else if t.pstate == 1 {                                  // after ESC
+    if cp == 0x5B { t.pstate = 2; t.params = []; t.pcur = 0; t.priv = false; }  // '[' → CSI
+    else if cp == 0x44 { term_linefeed(t); t.pstate = 0; }        // ESC D = IND
+    else if cp == 0x4D { term_rev_index(t); t.pstate = 0; }       // ESC M = RI
+    else { t.pstate = 0; }                                   // other ESC seqs (ESC=, ESC>): ignored
+  } else {                                                   // CSI: params → final
+    if cp == 0x1B { t.pstate = 1; }                          // ESC aborts + restarts
+    else if cp == 0x3F { t.priv = true; }                    // '?' DEC private marker
+    else if cp >= 0x30 and cp <= 0x39 { t.pcur = t.pcur * 10 + (cp - 0x30); }  // digit
+    else if cp == 0x3B { t.params += [t.pcur]; t.pcur = 0; }                   // ';'
+    else if cp >= 0x40 and cp <= 0x7E {                      // final byte
+      t.params += [t.pcur];
+      csi_dispatch(t, fc, t.params);
+      t.pstate = 0;
     }
+    // intermediates / unknown bytes are ignored
   }
+}
+
+// Feed a char stream. (The SSH path decodes PTY bytes→chars first — Step 4.)
+pub fn term_feed(t: Term, s: text) {
+  for fc in s { term_feed_cp(t, fc as integer, fc); }
+}
+
+// Feed raw bytes — the recorded-corpus + eventual SSH/PTY path. ASCII/escape
+// bytes map 1:1 to codepoints (full UTF-8 decoding is a later concern).
+pub fn term_feed_bytes(t: Term, bytes: vector<integer>) {
+  for b in bytes { term_feed_cp(t, b, b as character); }
+}
+
+// The trimmed text of grid row r (trailing spaces removed) — for corpus asserts.
+fn term_line_text(t: const Term, r: integer) -> text {
+  last = -1;
+  for c in 0..t.grid.cols {
+    if term_ch_at(t, c, r) != ' ' { last = c; }
+  }
+  if last < 0 { return ""; }
+  s = "";
+  for c in 0..=last { s = "{s}{term_ch_at(t, c, r)}"; }
+  s
 }
 
 // A grid with no font metrics — for model tests that assert state without rendering.
@@ -585,6 +605,34 @@ fn scene_vt5(font: integer) -> Canvas {
   render_grid(t.grid)
 }
 
+// --- Step 2.6: corpus replay — a recorded REAL byte stream ---
+
+// A recorded REAL frame: `less -R` rendering a 6-line file at 32x10 (captured via
+// `script`, 144 bytes — less's init + draw, trimming only the quit-cleanup `\r\x1b[K`
+// so the drawn status line survives). Exercises alt-screen (?1049h), a reverse-video
+// status line, EL, SGR reset, CRLF row advance — plus sequences we IGNORE (title-
+// stack `t`, DECCKM ?1h, keypad ESC=), proving the parser skips the unknown gracefully.
+fn corpus_bytes() -> vector<integer> {
+  [
+  27, 91, 63, 49, 48, 52, 57, 104, 27, 91, 50, 50, 59, 48, 59, 48,
+  116, 27, 91, 63, 49, 104, 27, 61, 13, 102, 110, 32, 109, 97, 105, 110,
+  40, 41, 32, 123, 27, 91, 109, 13, 10, 32, 32, 32, 32, 108, 101, 116,
+  32, 120, 32, 61, 32, 52, 50, 59, 27, 91, 109, 13, 10, 32, 32, 32,
+  32, 112, 114, 105, 110, 116, 40, 120, 41, 59, 27, 91, 109, 13, 10, 125,
+  27, 91, 109, 13, 10, 108, 105, 110, 101, 32, 102, 105, 118, 101, 27, 91,
+  109, 13, 10, 108, 105, 110, 101, 32, 115, 105, 120, 27, 91, 109, 13, 10,
+  27, 91, 55, 109, 99, 111, 114, 112, 117, 115, 95, 115, 114, 99, 46, 116,
+  120, 116, 32, 40, 69, 78, 68, 41, 27, 91, 50, 55, 109, 27, 91, 75
+  ]
+}
+
+// Replay the recorded less frame and render the resulting screen.
+fn scene_vt6(font: integer) -> Canvas {
+  t = term_new(make_grid(font, 20.0, 32, 10));
+  term_feed_bytes(t, corpus_bytes());
+  render_grid(t.grid)
+}
+
 fn render(scene_name: text) -> Canvas {
   if scene_name == "clear" {
     return canvas(256, 192, BG);
@@ -617,6 +665,9 @@ fn render(scene_name: text) -> Canvas {
   }
   if scene_name == "vt5" {
     return scene_vt5(font);
+  }
+  if scene_name == "vt6" {
+    return scene_vt6(font);
   }
   // "ready": the Step 0 single-line text scene.
   cv = canvas(256, 192, BG);
@@ -867,6 +918,25 @@ fn main() {
     term_feed(t4, "{esc}[2;3H{esc}[?1049h{esc}[1;1H{esc}[?1049l");
     assert(t4.cx == 2 and t4.cy == 1);
     println("vttest5: PASS");
+    return;
+  }
+
+  // (U) corpus replay — a recorded REAL `less` frame; assert the normalized screen.
+  if scene_name == "vttest6" {
+    t = term_new(make_grid_bare(32, 10));
+    term_feed_bytes(t, corpus_bytes());
+    assert(t.alt);                                          // less entered the alt screen
+    assert(term_line_text(t, 0) == "fn main() {{");   // `{{` is a literal `{` (loft interpolation escape)
+    assert(term_line_text(t, 1) == "    let x = 42;");
+    assert(term_line_text(t, 2) == "    print(x);");
+    assert(term_line_text(t, 3) == "}}");             // `}}` is a literal `}`
+    assert(term_line_text(t, 4) == "line five");
+    assert(term_line_text(t, 5) == "line six");
+    assert(term_line_text(t, 6) == "corpus_src.txt (END)");
+    // the status line is reverse-video; the file body is not.
+    assert((term_cell_at(t, 0, 6).attrs & ATTR_REV) != 0);
+    assert((term_cell_at(t, 0, 0).attrs & ATTR_REV) == 0);
+    println("vttest6: PASS");
     return;
   }
 
