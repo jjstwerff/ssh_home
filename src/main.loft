@@ -164,15 +164,19 @@ fn scene_fit(font: integer, size: float) -> Canvas {
 
 struct Term {
   grid: Grid,
-  cx: integer,          // cursor column (0-based)
-  cy: integer,          // cursor row (0-based)
-  fg: integer,          // current SGR foreground (SGR parsing arrives in 2.3)
-  bg: integer,          // current SGR background
-  wrap_next: boolean,   // DECAWM deferred-wrap latch
+  cx: integer,             // cursor column (0-based)
+  cy: integer,             // cursor row (0-based)
+  fg: integer,             // current SGR foreground (SGR parsing arrives in 2.3)
+  bg: integer,             // current SGR background
+  wrap_next: boolean,      // DECAWM deferred-wrap latch
+  pstate: integer,         // escape parser state: 0=ground, 1=esc, 2=csi (2.2)
+  params: vector<integer>, // CSI numeric parameters collected so far
+  pcur: integer,           // the CSI parameter currently being accumulated
 }
 
 pub fn term_new(grid: Grid) -> Term {
-  Term { grid: grid, cx: 0, cy: 0, fg: FG, bg: BG, wrap_next: false }
+  // params omitted → defaults to [] (a vector field is non-null, empty by default)
+  Term { grid: grid, cx: 0, cy: 0, fg: FG, bg: BG, wrap_next: false, pstate: 0, pcur: 0 }
 }
 
 fn clampi(v: integer, lo: integer, hi: integer) -> integer {
@@ -232,16 +236,83 @@ fn term_put_ch(t: Term, ch: character) {
   }
 }
 
-// Feed a char stream: dispatch C0 controls, else print. (CSI/SGR: 2.2/2.3.)
+// --- Step 2.2: CSI escape sequences — cursor moves (CUU/D/F/B, CUP) + erase (ED/EL) ---
+
+// Blank cells [c0..c1] (inclusive) on row r with the current bg. grid_put is
+// bounds-checked, so a reversed or oversized range is harmless.
+fn erase_line_seg(t: Term, c0: integer, c1: integer, r: integer) {
+  for c in c0..=c1 { grid_put(t.grid, c, r, ' ', t.fg, t.bg); }
+}
+
+// ED — erase in display. 0: cursor→end of screen; 1: start→cursor; 2/3: all.
+fn term_erase_display(t: Term, mode: integer) {
+  last = t.grid.cols - 1;
+  if mode == 2 or mode == 3 {
+    for r in 0..t.grid.rows { erase_line_seg(t, 0, last, r); }
+  } else if mode == 1 {
+    for r in 0..t.cy { erase_line_seg(t, 0, last, r); }
+    erase_line_seg(t, 0, t.cx, t.cy);
+  } else {                                       // 0 (default)
+    erase_line_seg(t, t.cx, last, t.cy);
+    for r in t.cy + 1..t.grid.rows { erase_line_seg(t, 0, last, r); }
+  }
+}
+
+// EL — erase in line. 0: cursor→end; 1: start→cursor; 2: whole line.
+fn term_erase_line(t: Term, mode: integer) {
+  last = t.grid.cols - 1;
+  if mode == 1 { erase_line_seg(t, 0, t.cx, t.cy); }
+  else if mode == 2 { erase_line_seg(t, 0, last, t.cy); }
+  else { erase_line_seg(t, t.cx, last, t.cy); }  // 0 (default)
+}
+
+// Dispatch a completed CSI `ESC [ params final`. Erase does NOT move the cursor;
+// cursor moves route through `term_move` (which clears the DECAWM latch).
+fn csi_dispatch(t: Term, final: character, params: vector<integer>) {
+  f = final as integer;
+  n = params[0] ?? 0;                            // first param (0 == absent/empty)
+  step = if n < 1 { 1 } else { n };              // cursor moves treat 0/absent as 1
+  if f == 0x41 { term_move(t, t.cx, t.cy - step); }        // 'A' CUU
+  else if f == 0x42 { term_move(t, t.cx, t.cy + step); }   // 'B' CUD
+  else if f == 0x43 { term_move(t, t.cx + step, t.cy); }   // 'C' CUF
+  else if f == 0x44 { term_move(t, t.cx - step, t.cy); }   // 'D' CUB
+  else if f == 0x48 or f == 0x66 {                          // 'H' CUP / 'f' HVP
+    row = params[0] ?? 1; if row < 1 { row = 1; }
+    col = params[1] ?? 1; if col < 1 { col = 1; }
+    term_move(t, col - 1, row - 1);              // CSI params are 1-based
+  }
+  else if f == 0x4A { term_erase_display(t, n); }          // 'J' ED
+  else if f == 0x4B { term_erase_line(t, n); }             // 'K' EL
+  // unrecognized finals ignored in 2.2 (SGR 'm' → 2.3; modes 'h'/'l' → 2.5)
+}
+
+// Feed a char stream through the escape parser: ground → C0/print, else an
+// `ESC [ … final` CSI. Parser state lives on the Term, so a sequence may span
+// feed chunks. (The SSH path decodes PTY bytes→chars before feeding — Step 4.)
 pub fn term_feed(t: Term, s: text) {
   for fc in s {
     cp = fc as integer;
-    if cp == 0x0A { term_linefeed(t); }                        // LF
-    else if cp == 0x0D { term_move(t, 0, t.cy); }              // CR
-    else if cp == 0x08 { term_move(t, t.cx - 1, t.cy); }       // BS
-    else if cp == 0x09 { term_move(t, next_tab(t.cx), t.cy); } // HT
-    else if cp >= 0x20 { term_put_ch(t, fc); }                 // printable
-    // remaining C0 (0x00–0x1F) are ignored until later sub-steps
+    if t.pstate == 0 {                                       // GROUND
+      if cp == 0x1B { t.pstate = 1; }                        // ESC
+      else if cp == 0x0A { term_linefeed(t); }               // LF
+      else if cp == 0x0D { term_move(t, 0, t.cy); }          // CR
+      else if cp == 0x08 { term_move(t, t.cx - 1, t.cy); }   // BS
+      else if cp == 0x09 { term_move(t, next_tab(t.cx), t.cy); } // HT
+      else if cp >= 0x20 { term_put_ch(t, fc); }             // printable
+    } else if t.pstate == 1 {                                // after ESC
+      if cp == 0x5B { t.pstate = 2; t.params = []; t.pcur = 0; }  // '[' → CSI
+      else { t.pstate = 0; }                                 // other ESC seqs: 2.4+
+    } else {                                                 // CSI: params → final
+      if cp == 0x1B { t.pstate = 1; }                        // ESC aborts + restarts
+      else if cp >= 0x30 and cp <= 0x39 { t.pcur = t.pcur * 10 + (cp - 0x30); }  // digit
+      else if cp == 0x3B { t.params += [t.pcur]; t.pcur = 0; }                   // ';'
+      else if cp >= 0x40 and cp <= 0x7E {                    // final byte
+        t.params += [t.pcur];
+        csi_dispatch(t, fc, t.params);
+        t.pstate = 0;
+      }
+      // intermediates / private markers ('?') are ignored in 2.2
+    }
   }
 }
 
@@ -267,6 +338,17 @@ fn scene_vt(font: integer) -> Canvas {
   render_grid(t.grid)
 }
 
+// A CSI golden: clear (ED), then place text at absolute positions (CUP).
+fn scene_vt2(font: integer) -> Canvas {
+  esc = 27 as character;
+  t = term_new(make_grid(font, 24.0, 20, 6));
+  term_feed(t, "{esc}[2J");              // ED: clear the screen
+  term_feed(t, "{esc}[1;1HCSI demo");    // CUP top-left
+  term_feed(t, "{esc}[3;5Hrow3 col5");   // CUP to (col5,row3)
+  term_feed(t, "{esc}[6;1Hbottom line"); // CUP bottom row
+  render_grid(t.grid)
+}
+
 fn render(scene_name: text) -> Canvas {
   if scene_name == "clear" {
     return canvas(256, 192, BG);
@@ -287,6 +369,9 @@ fn render(scene_name: text) -> Canvas {
   }
   if scene_name == "vt" {
     return scene_vt(font);
+  }
+  if scene_name == "vt2" {
+    return scene_vt2(font);
   }
   // "ready": the Step 0 single-line text scene.
   cv = canvas(256, 192, BG);
@@ -359,6 +444,64 @@ fn main() {
     assert(term_ch_at(t6, 0, 1) == 'C');     // C on the new bottom row
     assert(t6.cy == 1);
     println("vttest: PASS");
+    return;
+  }
+
+  // (U) CSI assertions — cursor moves (CUU/D/F/B, CUP) + erase (ED/EL).
+  if scene_name == "vttest2" {
+    esc = 27 as character;
+
+    // CUP is 1-based → (col-1, row-1); a glyph then lands there and advances.
+    t = term_new(make_grid_bare(10, 5));
+    term_feed(t, "{esc}[3;5HX");
+    assert(term_ch_at(t, 4, 2) == 'X');
+    assert(t.cx == 5 and t.cy == 2);
+
+    // CUP with no params homes to (0,0).
+    t2 = term_new(make_grid_bare(10, 5));
+    term_feed(t2, "abc{esc}[HZ");
+    assert(term_ch_at(t2, 0, 0) == 'Z' and t2.cx == 1 and t2.cy == 0);
+
+    // Relative moves: explicit n and default 1.
+    t3 = term_new(make_grid_bare(10, 5));
+    term_feed(t3, "{esc}[5;5H");   // → (4,4)
+    term_feed(t3, "{esc}[2A");     // up 2   → (4,2)
+    assert(t3.cx == 4 and t3.cy == 2);
+    term_feed(t3, "{esc}[3D");     // back 3 → (1,2)
+    assert(t3.cx == 1 and t3.cy == 2);
+    term_feed(t3, "{esc}[B");      // down 1 → (1,3)
+    assert(t3.cy == 3);
+    term_feed(t3, "{esc}[2C");     // fwd 2  → (3,3)
+    assert(t3.cx == 3);
+
+    // Moves clamp at the edges (no wrap / scroll).
+    t4 = term_new(make_grid_bare(4, 3));
+    term_feed(t4, "{esc}[99;99H");
+    assert(t4.cx == 3 and t4.cy == 2);
+    term_feed(t4, "{esc}[99A");
+    assert(t4.cy == 0);
+
+    // EL mode 0 (cursor→end) and mode 1 (start→cursor).
+    t5 = term_new(make_grid_bare(6, 2));
+    term_feed(t5, "ABCDEF{esc}[1;3H{esc}[0K");
+    assert(term_ch_at(t5, 1, 0) == 'B' and term_ch_at(t5, 2, 0) == ' ' and term_ch_at(t5, 5, 0) == ' ');
+    t6 = term_new(make_grid_bare(6, 2));
+    term_feed(t6, "ABCDEF{esc}[1;3H{esc}[1K");
+    assert(term_ch_at(t6, 0, 0) == ' ' and term_ch_at(t6, 2, 0) == ' ' and term_ch_at(t6, 3, 0) == 'D');
+
+    // ED mode 2 (whole screen).
+    t7 = term_new(make_grid_bare(4, 3));
+    term_feed(t7, "{esc}[2;2Hxy{esc}[2J");
+    assert(term_ch_at(t7, 1, 1) == ' ' and term_ch_at(t7, 2, 1) == ' ');
+
+    // ED mode 0 (cursor→end): keeps everything above/before the cursor.
+    t8 = term_new(make_grid_bare(3, 3));
+    term_feed(t8, "ABCDEFGHI{esc}[2;2H{esc}[0J");
+    assert(term_ch_at(t8, 0, 0) == 'A' and term_ch_at(t8, 2, 0) == 'C');  // row 0 intact
+    assert(term_ch_at(t8, 0, 1) == 'D');                                   // before cursor intact
+    assert(term_ch_at(t8, 1, 1) == ' ' and term_ch_at(t8, 2, 1) == ' ');  // E,F erased
+    assert(term_ch_at(t8, 0, 2) == ' ' and term_ch_at(t8, 2, 2) == ' ');  // row 2 erased
+    println("vttest2: PASS");
     return;
   }
 
