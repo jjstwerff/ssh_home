@@ -186,11 +186,14 @@ struct Term {
   pstate: integer,         // escape parser state: 0=ground, 1=esc, 2=csi (2.2)
   params: vector<integer>, // CSI numeric parameters collected so far
   pcur: integer,           // the CSI parameter currently being accumulated
+  top: integer,            // scroll-region top margin (0-based, inclusive) (2.4)
+  bot: integer,            // scroll-region bottom margin (0-based, inclusive)
 }
 
 pub fn term_new(grid: Grid) -> Term {
   // params omitted → defaults to [] (a vector field is non-null, empty by default)
-  Term { grid: grid, cx: 0, cy: 0, fg: FG, bg: BG, attrs: 0, wrap_next: false, pstate: 0, pcur: 0 }
+  Term { grid: grid, cx: 0, cy: 0, fg: FG, bg: BG, attrs: 0, wrap_next: false,
+         pstate: 0, pcur: 0, top: 0, bot: grid.rows - 1 }
 }
 
 fn clampi(v: integer, lo: integer, hi: integer) -> integer {
@@ -211,29 +214,86 @@ fn next_tab(cx: integer) -> integer {
   (q + 1) * 8
 }
 
-// Scroll the grid up one row; blank the new bottom row with `blank`.
-fn grid_scroll_up(g: Grid, blank: Cell) {
+// Scroll rows [top..bot] by `count`; up=true scrolls up (blanks at the bottom of
+// the region), up=false scrolls down (blanks at the top). `count` is clamped to
+// the region height. This is the one engine behind LF/IND/RI and IL/DL.
+fn grid_scroll_region(g: Grid, top: integer, bot: integer, count: integer, up: boolean, blank: Cell) {
+  h = bot - top + 1;
+  if count < 1 or h < 1 { return; }
+  cnt = if count > h { h } else { count };
   gc = &g.cells;
-  for r in 0..g.rows - 1 {
-    for c in 0..g.cols {
-      gc[r * g.cols + c] = gc[(r + 1) * g.cols + c];   // copy row r+1 → r
+  cols = g.cols;
+  if up {
+    for r in top..(bot - cnt + 1) {                       // dest rows shift up
+      for c in 0..cols { gc[r * cols + c] = gc[(r + cnt) * cols + c]; }
     }
-  }
-  lr = g.rows - 1;
-  for c in 0..g.cols {
-    gc[lr * g.cols + c] = blank;
+    for r in (bot - cnt + 1)..(bot + 1) {                 // blank the bottom `cnt`
+      for c in 0..cols { gc[r * cols + c] = blank; }
+    }
+  } else {
+    for r in rev((top + cnt)..(bot + 1)) {                // dest rows shift down
+      for c in 0..cols { gc[r * cols + c] = gc[(r - cnt) * cols + c]; }
+    }
+    for r in top..(top + cnt) {                           // blank the top `cnt`
+      for c in 0..cols { gc[r * cols + c] = blank; }
+    }
   }
 }
 
-// LF / index: move down one row, scrolling if already at the bottom. Column is
-// unchanged (raw PTY LF); CR is what resets the column.
+fn blank_cell(t: const Term) -> Cell { Cell { ch: ' ', fg: t.fg, bg: t.bg } }
+
+// LF / IND: move down one row within the scroll region, scrolling the region up if
+// already at the bottom margin. Column is unchanged (raw PTY LF); CR resets it.
 fn term_linefeed(t: Term) {
-  if t.cy >= t.grid.rows - 1 {
-    grid_scroll_up(t.grid, Cell { ch: ' ', fg: t.fg, bg: t.bg });
-  } else {
+  if t.cy == t.bot {
+    grid_scroll_region(t.grid, t.top, t.bot, 1, true, blank_cell(t));
+  } else if t.cy < t.grid.rows - 1 {
     t.cy += 1;
   }
   t.wrap_next = false;
+}
+
+// RI (reverse index): move up one row, scrolling the region down at the top margin.
+fn term_rev_index(t: Term) {
+  if t.cy == t.top {
+    grid_scroll_region(t.grid, t.top, t.bot, 1, false, blank_cell(t));
+  } else if t.cy > 0 {
+    t.cy -= 1;
+  }
+  t.wrap_next = false;
+}
+
+// IL — insert `count` blank lines at the cursor row (within the region); lines
+// below shift down, any pushed past the bottom margin are lost. Cursor → col 0.
+fn term_insert_lines(t: Term, count: integer) {
+  if t.cy >= t.top and t.cy <= t.bot {
+    grid_scroll_region(t.grid, t.cy, t.bot, count, false, blank_cell(t));
+    t.cx = 0;
+    t.wrap_next = false;
+  }
+}
+
+// DL — delete `count` lines at the cursor row (within the region); lines below
+// shift up, blanks appear at the bottom margin. Cursor → col 0.
+fn term_delete_lines(t: Term, count: integer) {
+  if t.cy >= t.top and t.cy <= t.bot {
+    grid_scroll_region(t.grid, t.cy, t.bot, count, true, blank_cell(t));
+    t.cx = 0;
+    t.wrap_next = false;
+  }
+}
+
+// DECSTBM — set the scroll region to rows [top..bot] (1-based params); an invalid
+// region is ignored, and (origin mode off) the cursor homes to (0,0).
+fn term_set_region(t: Term, params: vector<integer>) {
+  top1 = params[0] ?? 1; if top1 < 1 { top1 = 1; }
+  bot1 = params[1] ?? t.grid.rows;
+  if bot1 < 1 or bot1 > t.grid.rows { bot1 = t.grid.rows; }
+  if top1 < bot1 {
+    t.top = top1 - 1;
+    t.bot = bot1 - 1;
+    term_move(t, 0, 0);
+  }
 }
 
 // Print one glyph at the cursor, honouring the deferred wrap, then advance.
@@ -366,7 +426,10 @@ fn csi_dispatch(t: Term, final: character, params: vector<integer>) {
   }
   else if f == 0x4A { term_erase_display(t, n); }          // 'J' ED
   else if f == 0x4B { term_erase_line(t, n); }             // 'K' EL
+  else if f == 0x4C { term_insert_lines(t, step); }        // 'L' IL
+  else if f == 0x4D { term_delete_lines(t, step); }        // 'M' DL
   else if f == 0x6D { apply_sgr(t, params); }              // 'm' SGR
+  else if f == 0x72 { term_set_region(t, params); }        // 'r' DECSTBM
   // unrecognized finals ignored (modes 'h'/'l' → 2.5)
 }
 
@@ -385,7 +448,9 @@ pub fn term_feed(t: Term, s: text) {
       else if cp >= 0x20 { term_put_ch(t, fc); }             // printable
     } else if t.pstate == 1 {                                // after ESC
       if cp == 0x5B { t.pstate = 2; t.params = []; t.pcur = 0; }  // '[' → CSI
-      else { t.pstate = 0; }                                 // other ESC seqs: 2.4+
+      else if cp == 0x44 { term_linefeed(t); t.pstate = 0; }      // ESC D = IND
+      else if cp == 0x4D { term_rev_index(t); t.pstate = 0; }     // ESC M = RI
+      else { t.pstate = 0; }                                 // other ESC seqs: later
     } else {                                                 // CSI: params → final
       if cp == 0x1B { t.pstate = 1; }                        // ESC aborts + restarts
       else if cp >= 0x30 and cp <= 0x39 { t.pcur = t.pcur * 10 + (cp - 0x30); }  // digit
@@ -449,6 +514,17 @@ fn scene_vt3(font: integer) -> Canvas {
   render_grid(t.grid)
 }
 
+// A scroll-region golden: a static header, then feed 7 lines into a 6-row region
+// so it scrolls while row 1 (the header) stays put (the tmux-status-bar pattern).
+fn scene_vt4(font: integer) -> Canvas {
+  esc = 27 as character;
+  t = term_new(make_grid(font, 22.0, 18, 7));
+  term_feed(t, "{esc}[1;1H== header ==");
+  term_feed(t, "{esc}[2;7r{esc}[2;1H");   // region rows 2..7, cursor into it
+  term_feed(t, "line 1\r\nline 2\r\nline 3\r\nline 4\r\nline 5\r\nline 6\r\nline 7");
+  render_grid(t.grid)
+}
+
 fn render(scene_name: text) -> Canvas {
   if scene_name == "clear" {
     return canvas(256, 192, BG);
@@ -475,6 +551,9 @@ fn render(scene_name: text) -> Canvas {
   }
   if scene_name == "vt3" {
     return scene_vt3(font);
+  }
+  if scene_name == "vt4" {
+    return scene_vt4(font);
   }
   // "ready": the Step 0 single-line text scene.
   cv = canvas(256, 192, BG);
@@ -645,6 +724,45 @@ fn main() {
     cq = term_cell_at(t5, 0, 0);
     assert(cq.fg == FG and (cq.attrs & ATTR_BOLD) != 0);
     println("vttest3: PASS");
+    return;
+  }
+
+  // (U) scroll-region assertions — DECSTBM, IND/RI, IL/DL.
+  if scene_name == "vttest4" {
+    esc = 27 as character;
+    seed = "{esc}[1;1HA{esc}[2;1HB{esc}[3;1HC{esc}[4;1HD{esc}[5;1HE";  // rows 0-4 col0
+
+    // IND at the bottom margin scrolls ONLY the region [1..3]; rows 0 and 4 stay.
+    t = term_new(make_grid_bare(3, 5));
+    term_feed(t, "{seed}{esc}[2;4r{esc}[4;1H{esc}D");
+    assert(term_ch_at(t, 0, 0) == 'A' and term_ch_at(t, 0, 4) == 'E');   // outside region
+    assert(term_ch_at(t, 0, 1) == 'C' and term_ch_at(t, 0, 2) == 'D');   // B scrolled off
+    assert(term_ch_at(t, 0, 3) == ' ');                                   // blank at region bottom
+
+    // RI at the top margin scrolls the region down.
+    t2 = term_new(make_grid_bare(3, 5));
+    term_feed(t2, "{seed}{esc}[2;4r{esc}[2;1H{esc}M");
+    assert(term_ch_at(t2, 0, 0) == 'A' and term_ch_at(t2, 0, 4) == 'E');
+    assert(term_ch_at(t2, 0, 1) == ' ');
+    assert(term_ch_at(t2, 0, 2) == 'B' and term_ch_at(t2, 0, 3) == 'C');
+
+    // IL inserts a blank line at the cursor (default region); E pushed off.
+    t3 = term_new(make_grid_bare(3, 5));
+    term_feed(t3, "{seed}{esc}[2;1H{esc}[1L");
+    assert(term_ch_at(t3, 0, 0) == 'A' and term_ch_at(t3, 0, 1) == ' ');
+    assert(term_ch_at(t3, 0, 2) == 'B' and term_ch_at(t3, 0, 4) == 'D');
+
+    // DL deletes the cursor line; the rest shift up, blank at the bottom.
+    t4 = term_new(make_grid_bare(3, 5));
+    term_feed(t4, "{seed}{esc}[2;1H{esc}[1M");
+    assert(term_ch_at(t4, 0, 0) == 'A' and term_ch_at(t4, 0, 1) == 'C');
+    assert(term_ch_at(t4, 0, 3) == 'E' and term_ch_at(t4, 0, 4) == ' ');
+
+    // DECSTBM sets the 0-based region and homes the cursor.
+    t5 = term_new(make_grid_bare(4, 6));
+    term_feed(t5, "{esc}[3;5H{esc}[2;5r");
+    assert(t5.cx == 0 and t5.cy == 0 and t5.top == 1 and t5.bot == 4);
+    println("vttest4: PASS");
     return;
   }
 
