@@ -188,12 +188,22 @@ struct Term {
   pcur: integer,           // the CSI parameter currently being accumulated
   top: integer,            // scroll-region top margin (0-based, inclusive) (2.4)
   bot: integer,            // scroll-region bottom margin (0-based, inclusive)
+  priv: boolean,           // CSI private-marker (`?`) seen this sequence (2.5)
+  cursor_visible: boolean, // DECTCEM ?25
+  mouse_track: integer,    // mouse tracking mode: 0 / 1000 / 1002 / 1003
+  mouse_sgr: boolean,      // ?1006 SGR mouse encoding (Step 3 input reads these)
+  alt: boolean,            // on the alternate screen (?1049)
+  saved_cells: vector<Cell>, // primary-screen snapshot while on the alt screen
+  saved_cx: integer,       // cursor saved on entering the alt screen
+  saved_cy: integer,
 }
 
 pub fn term_new(grid: Grid) -> Term {
-  // params omitted → defaults to [] (a vector field is non-null, empty by default)
+  // vector fields (params, saved_cells) omitted → default [] (non-null, empty)
   Term { grid: grid, cx: 0, cy: 0, fg: FG, bg: BG, attrs: 0, wrap_next: false,
-         pstate: 0, pcur: 0, top: 0, bot: grid.rows - 1 }
+         pstate: 0, pcur: 0, top: 0, bot: grid.rows - 1,
+         priv: false, cursor_visible: true, mouse_track: 0, mouse_sgr: false,
+         alt: false, saved_cx: 0, saved_cy: 0 }
 }
 
 fn clampi(v: integer, lo: integer, hi: integer) -> integer {
@@ -293,6 +303,42 @@ fn term_set_region(t: Term, params: vector<integer>) {
     t.top = top1 - 1;
     t.bot = bot1 - 1;
     term_move(t, 0, 0);
+  }
+}
+
+// --- Step 2.5: DEC private modes (`ESC[?Pm h/l`) — the ones tmux drives ---
+
+// Replace a grid's cell buffer (a by-value grid field aliases, so this propagates).
+fn grid_set_cells(g: Grid, cells: vector<Cell>) { g.cells = cells; }
+
+// DEC private mode set (h) / reset (l). Mouse flags only LATCH here; Step 3's input
+// encoding reads them. ?1049 swaps the alternate screen.
+fn set_dec_mode(t: Term, params: vector<integer>, on: boolean) {
+  for pm in params {
+    if pm == 25 { t.cursor_visible = on; }                          // DECTCEM show/hide
+    else if pm == 1000 { t.mouse_track = if on { 1000 } else { 0 }; } // X10/normal tracking
+    else if pm == 1002 { t.mouse_track = if on { 1002 } else { 0 }; } // button-event tracking
+    else if pm == 1003 { t.mouse_track = if on { 1003 } else { 0 }; } // any-event tracking
+    else if pm == 1006 { t.mouse_sgr = on; }                         // SGR mouse encoding
+    else if pm == 1049 { term_alt_screen(t, on); }                   // alternate screen
+  }
+}
+
+// ?1049 — enter: snapshot the primary cells + cursor, blank the screen; leave:
+// restore both. The snapshot is an independent copy (whole-value bind copies).
+fn term_alt_screen(t: Term, on: boolean) {
+  if on and !t.alt {
+    t.saved_cells = t.grid.cells;
+    t.saved_cx = t.cx;
+    t.saved_cy = t.cy;
+    term_erase_display(t, 2);          // the alt screen starts blank
+    t.alt = true;
+  } else if !on and t.alt {
+    grid_set_cells(t.grid, t.saved_cells);
+    t.cx = t.saved_cx;
+    t.cy = t.saved_cy;
+    t.wrap_next = false;
+    t.alt = false;
   }
 }
 
@@ -430,7 +476,9 @@ fn csi_dispatch(t: Term, final: character, params: vector<integer>) {
   else if f == 0x4D { term_delete_lines(t, step); }        // 'M' DL
   else if f == 0x6D { apply_sgr(t, params); }              // 'm' SGR
   else if f == 0x72 { term_set_region(t, params); }        // 'r' DECSTBM
-  // unrecognized finals ignored (modes 'h'/'l' → 2.5)
+  else if f == 0x68 { if t.priv { set_dec_mode(t, params, true); } }   // 'h' DEC set
+  else if f == 0x6C { if t.priv { set_dec_mode(t, params, false); } }  // 'l' DEC reset
+  // unrecognized finals ignored
 }
 
 // Feed a char stream through the escape parser: ground → C0/print, else an
@@ -447,12 +495,13 @@ pub fn term_feed(t: Term, s: text) {
       else if cp == 0x09 { term_move(t, next_tab(t.cx), t.cy); } // HT
       else if cp >= 0x20 { term_put_ch(t, fc); }             // printable
     } else if t.pstate == 1 {                                // after ESC
-      if cp == 0x5B { t.pstate = 2; t.params = []; t.pcur = 0; }  // '[' → CSI
+      if cp == 0x5B { t.pstate = 2; t.params = []; t.pcur = 0; t.priv = false; }  // '[' → CSI
       else if cp == 0x44 { term_linefeed(t); t.pstate = 0; }      // ESC D = IND
       else if cp == 0x4D { term_rev_index(t); t.pstate = 0; }     // ESC M = RI
       else { t.pstate = 0; }                                 // other ESC seqs: later
     } else {                                                 // CSI: params → final
       if cp == 0x1B { t.pstate = 1; }                        // ESC aborts + restarts
+      else if cp == 0x3F { t.priv = true; }                  // '?' DEC private marker
       else if cp >= 0x30 and cp <= 0x39 { t.pcur = t.pcur * 10 + (cp - 0x30); }  // digit
       else if cp == 0x3B { t.params += [t.pcur]; t.pcur = 0; }                   // ';'
       else if cp >= 0x40 and cp <= 0x7E {                    // final byte
@@ -525,6 +574,17 @@ fn scene_vt4(font: integer) -> Canvas {
   render_grid(t.grid)
 }
 
+// An alt-screen golden: write the primary buffer, switch to the alternate screen
+// (?1049h) — which blanks it — then draw on the alt buffer.
+fn scene_vt5(font: integer) -> Canvas {
+  esc = 27 as character;
+  t = term_new(make_grid(font, 22.0, 20, 5));
+  term_feed(t, "primary line one\r\nprimary line two");
+  term_feed(t, "{esc}[?1049h");                          // enter alt (blanks the screen)
+  term_feed(t, "{esc}[1;1H-- alt screen --\r\n(1049h active)");
+  render_grid(t.grid)
+}
+
 fn render(scene_name: text) -> Canvas {
   if scene_name == "clear" {
     return canvas(256, 192, BG);
@@ -554,6 +614,9 @@ fn render(scene_name: text) -> Canvas {
   }
   if scene_name == "vt4" {
     return scene_vt4(font);
+  }
+  if scene_name == "vt5" {
+    return scene_vt5(font);
   }
   // "ready": the Step 0 single-line text scene.
   cv = canvas(256, 192, BG);
@@ -763,6 +826,47 @@ fn main() {
     term_feed(t5, "{esc}[3;5H{esc}[2;5r");
     assert(t5.cx == 0 and t5.cy == 0 and t5.top == 1 and t5.bot == 4);
     println("vttest4: PASS");
+    return;
+  }
+
+  // (U) DEC private modes — cursor show/hide, mouse latches, alt screen.
+  if scene_name == "vttest5" {
+    esc = 27 as character;
+
+    // DECTCEM ?25 cursor show/hide.
+    t = term_new(make_grid_bare(5, 2));
+    assert(t.cursor_visible);
+    term_feed(t, "{esc}[?25l");
+    assert(!t.cursor_visible);
+    term_feed(t, "{esc}[?25h");
+    assert(t.cursor_visible);
+
+    // Mouse tracking + SGR encoding latch (Step 3 reads these).
+    t2 = term_new(make_grid_bare(5, 2));
+    assert(t2.mouse_track == 0 and !t2.mouse_sgr);
+    term_feed(t2, "{esc}[?1002h{esc}[?1006h");
+    assert(t2.mouse_track == 1002 and t2.mouse_sgr);
+    term_feed(t2, "{esc}[?1002l{esc}[?1006l");
+    assert(t2.mouse_track == 0 and !t2.mouse_sgr);
+    term_feed(t2, "{esc}[?1000h");
+    assert(t2.mouse_track == 1000);
+
+    // Alt screen: primary saved, alt blank + writable, primary restored on exit.
+    t3 = term_new(make_grid_bare(5, 2));
+    term_feed(t3, "{esc}[1;1HPRIM");
+    assert(term_ch_at(t3, 0, 0) == 'P');
+    term_feed(t3, "{esc}[?1049h");
+    assert(t3.alt and term_ch_at(t3, 0, 0) == ' ');      // alt starts blank
+    term_feed(t3, "{esc}[1;1HALT");
+    assert(term_ch_at(t3, 0, 0) == 'A');
+    term_feed(t3, "{esc}[?1049l");
+    assert(!t3.alt and term_ch_at(t3, 0, 0) == 'P' and term_ch_at(t3, 3, 0) == 'M');
+
+    // Alt screen saves + restores the cursor.
+    t4 = term_new(make_grid_bare(10, 3));
+    term_feed(t4, "{esc}[2;3H{esc}[?1049h{esc}[1;1H{esc}[?1049l");
+    assert(t4.cx == 2 and t4.cy == 1);
+    println("vttest5: PASS");
     return;
   }
 
