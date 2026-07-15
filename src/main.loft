@@ -17,12 +17,17 @@ FONT = "../fonts/DejaVuSansMono.ttf";   // relative to the source dir (src/)
 BG = 0xFF101820;                         // default background (0xAARRGGBB)
 FG = 0xFFE8F0FF;                         // default foreground
 
-// A terminal cell: a glyph + fg/bg colours. Attributes (bold, reverse, …) arrive
-// with the SGR handling in Step 2.
+ATTR_BOLD = 1;                           // SGR attribute bits (Step 2.3)
+ATTR_UNDER = 2;
+ATTR_REV = 4;
+
+// A terminal cell: a glyph + fg/bg colours (0xAARRGGBB) + SGR attribute bits
+// (bold / underline / reverse). The renderer resolves the attributes at draw time.
 struct Cell {
   ch: character,
   fg: integer,
   bg: integer,
+  attrs: integer = 0,
 }
 
 // A cols x rows grid (row-major) plus the font + cell metrics to rasterize it.
@@ -52,10 +57,10 @@ pub fn make_grid(font: integer, size: float, cols: integer, rows: integer) -> Gr
 
 // Write one cell (bounds-checked). `&g.cells` is a writable alias so the element
 // write propagates back through the grid.
-pub fn grid_put(g: Grid, c: integer, r: integer, ch: character, fg: integer, bg: integer) {
+pub fn grid_put(g: Grid, c: integer, r: integer, ch: character, fg: integer, bg: integer, attrs: integer = 0) {
   if c >= 0 and c < g.cols and r >= 0 and r < g.rows {
     gc = &g.cells;
-    gc[r * g.cols + c] = Cell { ch: ch, fg: fg, bg: bg };
+    gc[r * g.cols + c] = Cell { ch: ch, fg: fg, bg: bg, attrs: attrs };
   }
 }
 
@@ -77,9 +82,17 @@ pub fn render_grid(g: const Grid) -> Canvas {
       cell = rg_cells[rg_r * g.cols + rg_c] ?? Cell { ch: ' ', fg: FG, bg: BG };
       px = rg_c * g.cell_w;
       py = rg_r * g.cell_h;
-      cv.fill_rect(px, py, g.cell_w, g.cell_h, cell.bg);
+      // resolve SGR attributes: reverse swaps fg/bg, bold brightens the fg.
+      efg = cell.fg;
+      ebg = cell.bg;
+      if (cell.attrs & ATTR_REV) != 0 { efg = cell.bg; ebg = cell.fg; }
+      if (cell.attrs & ATTR_BOLD) != 0 { efg = brighten(efg); }
+      cv.fill_rect(px, py, g.cell_w, g.cell_h, ebg);
       if cell.ch != ' ' {
-        cv.draw_text(g.font, "{cell.ch}", g.size, px, py, cell.fg);
+        cv.draw_text(g.font, "{cell.ch}", g.size, px, py, efg);
+      }
+      if (cell.attrs & ATTR_UNDER) != 0 {
+        cv.fill_rect(px, py + g.cell_h - 2, g.cell_w, 1, efg);   // underline
       }
     }
   }
@@ -166,8 +179,9 @@ struct Term {
   grid: Grid,
   cx: integer,             // cursor column (0-based)
   cy: integer,             // cursor row (0-based)
-  fg: integer,             // current SGR foreground (SGR parsing arrives in 2.3)
+  fg: integer,             // current SGR foreground (0xAARRGGBB)
   bg: integer,             // current SGR background
+  attrs: integer,          // current SGR attribute bits (ATTR_BOLD/UNDER/REV) (2.3)
   wrap_next: boolean,      // DECAWM deferred-wrap latch
   pstate: integer,         // escape parser state: 0=ground, 1=esc, 2=csi (2.2)
   params: vector<integer>, // CSI numeric parameters collected so far
@@ -176,7 +190,7 @@ struct Term {
 
 pub fn term_new(grid: Grid) -> Term {
   // params omitted → defaults to [] (a vector field is non-null, empty by default)
-  Term { grid: grid, cx: 0, cy: 0, fg: FG, bg: BG, wrap_next: false, pstate: 0, pcur: 0 }
+  Term { grid: grid, cx: 0, cy: 0, fg: FG, bg: BG, attrs: 0, wrap_next: false, pstate: 0, pcur: 0 }
 }
 
 fn clampi(v: integer, lo: integer, hi: integer) -> integer {
@@ -228,7 +242,7 @@ fn term_put_ch(t: Term, ch: character) {
     t.cx = 0;
     term_linefeed(t);          // down (+scroll); clears wrap_next
   }
-  grid_put(t.grid, t.cx, t.cy, ch, t.fg, t.bg);
+  grid_put(t.grid, t.cx, t.cy, ch, t.fg, t.bg, t.attrs);
   if t.cx >= t.grid.cols - 1 {
     t.wrap_next = true;        // at the right margin: latch instead of advancing
   } else {
@@ -266,6 +280,75 @@ fn term_erase_line(t: Term, mode: integer) {
   else { erase_line_seg(t, t.cx, last, t.cy); }  // 0 (default)
 }
 
+// --- Step 2.3: SGR (colours + attributes) ---
+
+// Colours are packed 0xFFRRGGBB — graphics' `rgb(r,g,b)` (== `rgba(r,g,b,255)`)
+// already produces exactly that, so we reuse it rather than redefine it.
+
+// The 16 ANSI colours (standard 0-7, bright 8-15).
+fn ansi16(n: integer) -> integer {
+  pal = [0xFF000000, 0xFFCD0000, 0xFF00CD00, 0xFFCDCD00, 0xFF0000EE, 0xFFCD00CD, 0xFF00CDCD, 0xFFE5E5E5,
+         0xFF7F7F7F, 0xFFFF0000, 0xFF00FF00, 0xFFFFFF00, 0xFF5C5CFF, 0xFFFF00FF, 0xFF00FFFF, 0xFFFFFFFF];
+  pal[n] ?? 0xFFFFFFFF
+}
+
+// One axis of the 6x6x6 colour cube (0 → 0, else 55 + 40·v). (graphics owns `cube`
+// as a 3D primitive, so this is `cube6`.)
+fn cube6(v: integer) -> integer { if v == 0 { 0 } else { 55 + v * 40 } }
+
+// Resolve an xterm 256-colour index to 0xFFRRGGBB.
+fn color256(n: integer) -> integer {
+  if n < 16 { return ansi16(n); }
+  if n >= 232 { gy = 8 + (n - 232) * 10; return rgb(gy, gy, gy); }   // grayscale ramp
+  i = n - 16;
+  r6 = i / 36 ?? 0;
+  g6 = (i / 6 ?? 0) % 6 ?? 0;
+  b6 = i % 6 ?? 0;
+  rgb(cube6(r6), cube6(g6), cube6(b6))
+}
+
+// Brighten a colour (bold): lift each channel toward white.
+fn lift(v: integer) -> integer { w = v + 64; if w > 255 { 255 } else { w } }
+fn brighten(c: integer) -> integer {
+  rgb(lift((c >> 16) & 0xFF), lift((c >> 8) & 0xFF), lift(c & 0xFF))
+}
+
+// Apply an SGR sequence (`ESC [ … m`): update fg / bg / attribute bits. 38 / 48
+// consume a colour spec (`5;n` = 256-colour, `2;r;g;b` = truecolor).
+fn apply_sgr(t: Term, params: vector<integer>) {
+  n = len(params);
+  i = 0;
+  while i < n {
+    p = params[i] ?? 0;
+    if p == 0 { t.fg = FG; t.bg = BG; t.attrs = 0; }
+    else if p == 1 { t.attrs = t.attrs | ATTR_BOLD; }
+    else if p == 4 { t.attrs = t.attrs | ATTR_UNDER; }
+    else if p == 7 { t.attrs = t.attrs | ATTR_REV; }
+    else if p == 22 { t.attrs = t.attrs & ~ATTR_BOLD; }
+    else if p == 24 { t.attrs = t.attrs & ~ATTR_UNDER; }
+    else if p == 27 { t.attrs = t.attrs & ~ATTR_REV; }
+    else if p == 39 { t.fg = FG; }
+    else if p == 49 { t.bg = BG; }
+    else if p >= 30 and p <= 37 { t.fg = ansi16(p - 30); }
+    else if p >= 40 and p <= 47 { t.bg = ansi16(p - 40); }
+    else if p >= 90 and p <= 97 { t.fg = ansi16(p - 90 + 8); }
+    else if p >= 100 and p <= 107 { t.bg = ansi16(p - 100 + 8); }
+    else if p == 38 or p == 48 {
+      mode = params[i + 1] ?? 0;
+      if mode == 5 {
+        col = color256(params[i + 2] ?? 0);
+        if p == 38 { t.fg = col; } else { t.bg = col; }
+        i = i + 2;
+      } else if mode == 2 {
+        col = rgb(params[i + 2] ?? 0, params[i + 3] ?? 0, params[i + 4] ?? 0);
+        if p == 38 { t.fg = col; } else { t.bg = col; }
+        i = i + 4;
+      }
+    }
+    i = i + 1;
+  }
+}
+
 // Dispatch a completed CSI `ESC [ params final`. Erase does NOT move the cursor;
 // cursor moves route through `term_move` (which clears the DECAWM latch).
 fn csi_dispatch(t: Term, final: character, params: vector<integer>) {
@@ -283,7 +366,8 @@ fn csi_dispatch(t: Term, final: character, params: vector<integer>) {
   }
   else if f == 0x4A { term_erase_display(t, n); }          // 'J' ED
   else if f == 0x4B { term_erase_line(t, n); }             // 'K' EL
-  // unrecognized finals ignored in 2.2 (SGR 'm' → 2.3; modes 'h'/'l' → 2.5)
+  else if f == 0x6D { apply_sgr(t, params); }              // 'm' SGR
+  // unrecognized finals ignored (modes 'h'/'l' → 2.5)
 }
 
 // Feed a char stream through the escape parser: ground → C0/print, else an
@@ -328,6 +412,10 @@ fn term_ch_at(t: const Term, c: integer, r: integer) -> character {
   cell.ch
 }
 
+fn term_cell_at(t: const Term, c: integer, r: integer) -> Cell {
+  t.grid.cells[r * t.grid.cols + c] ?? Cell { ch: ' ', fg: FG, bg: BG }
+}
+
 // A render golden: CRLF text + a tab + a line that DECAWM-wraps past the margin.
 fn scene_vt(font: integer) -> Canvas {
   t = term_new(make_grid(font, 24.0, 22, 7));
@@ -346,6 +434,18 @@ fn scene_vt2(font: integer) -> Canvas {
   term_feed(t, "{esc}[1;1HCSI demo");    // CUP top-left
   term_feed(t, "{esc}[3;5Hrow3 col5");   // CUP to (col5,row3)
   term_feed(t, "{esc}[6;1Hbottom line"); // CUP bottom row
+  render_grid(t.grid)
+}
+
+// An SGR golden: 16-colour fg, bold/underline/reverse, bright-on-bg, 256, truecolor.
+fn scene_vt3(font: integer) -> Canvas {
+  esc = 27 as character;
+  t = term_new(make_grid(font, 24.0, 24, 8));
+  term_feed(t, "{esc}[31mred {esc}[32mgreen {esc}[34mblue{esc}[0m\r\n");
+  term_feed(t, "{esc}[1mbold {esc}[4munder {esc}[7mrev{esc}[0m\r\n");
+  term_feed(t, "{esc}[93;44mbright on blue{esc}[0m\r\n");
+  term_feed(t, "{esc}[38;5;208m256-orange{esc}[0m\r\n");
+  term_feed(t, "{esc}[48;2;80;0;80mtruecolor bg{esc}[0m");
   render_grid(t.grid)
 }
 
@@ -372,6 +472,9 @@ fn render(scene_name: text) -> Canvas {
   }
   if scene_name == "vt2" {
     return scene_vt2(font);
+  }
+  if scene_name == "vt3" {
+    return scene_vt3(font);
   }
   // "ready": the Step 0 single-line text scene.
   cv = canvas(256, 192, BG);
@@ -502,6 +605,46 @@ fn main() {
     assert(term_ch_at(t8, 1, 1) == ' ' and term_ch_at(t8, 2, 1) == ' ');  // E,F erased
     assert(term_ch_at(t8, 0, 2) == ' ' and term_ch_at(t8, 2, 2) == ' ');  // row 2 erased
     println("vttest2: PASS");
+    return;
+  }
+
+  // (U) SGR assertions — 16/256/truecolor fg+bg, bold/underline/reverse.
+  if scene_name == "vttest3" {
+    esc = 27 as character;
+
+    // 16-colour fg + bg, then reset.
+    t = term_new(make_grid_bare(10, 2));
+    term_feed(t, "{esc}[31;42mX{esc}[0mY");
+    cx0 = term_cell_at(t, 0, 0);
+    assert(cx0.ch == 'X' and cx0.fg == ansi16(1) and cx0.bg == ansi16(2));
+    cy0 = term_cell_at(t, 1, 0);
+    assert(cy0.fg == FG and cy0.bg == BG and cy0.attrs == 0);
+
+    // attribute bits set together, then clear bold only (underline stays).
+    t2 = term_new(make_grid_bare(10, 2));
+    term_feed(t2, "{esc}[1;4;7mZ{esc}[22mW");
+    cz = term_cell_at(t2, 0, 0);
+    assert((cz.attrs & ATTR_BOLD) != 0 and (cz.attrs & ATTR_UNDER) != 0 and (cz.attrs & ATTR_REV) != 0);
+    cw = term_cell_at(t2, 1, 0);
+    assert((cw.attrs & ATTR_BOLD) == 0 and (cw.attrs & ATTR_UNDER) != 0);
+
+    // 256-colour fg (38;5;n) and truecolor bg (48;2;r;g;b).
+    t3 = term_new(make_grid_bare(10, 2));
+    term_feed(t3, "{esc}[38;5;208mA{esc}[48;2;10;20;30mB");
+    assert(term_cell_at(t3, 0, 0).fg == color256(208));
+    assert(term_cell_at(t3, 1, 0).bg == rgb(10, 20, 30));
+
+    // bright fg (90-97) maps to the bright half of the palette.
+    t4 = term_new(make_grid_bare(10, 2));
+    term_feed(t4, "{esc}[92mG");
+    assert(term_cell_at(t4, 0, 0).fg == ansi16(10));
+
+    // default fg (39) resets colour but keeps attributes.
+    t5 = term_new(make_grid_bare(10, 2));
+    term_feed(t5, "{esc}[31;1m{esc}[39mQ");
+    cq = term_cell_at(t5, 0, 0);
+    assert(cq.fg == FG and (cq.attrs & ATTR_BOLD) != 0);
+    println("vttest3: PASS");
     return;
   }
 
