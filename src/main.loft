@@ -118,8 +118,11 @@ pub fn cell_h_for(font: integer, size: float) -> integer { gl_text_height(font, 
 // How many whole cols × rows fit a `win_w` × `win_h` pixel window. Zero cell
 // size (a failed font) yields 0×0 rather than a divide-by-zero.
 pub fn grid_cols_rows(win_w: integer, win_h: integer, cell_w: integer, cell_h: integer) -> (integer, integer) {
-  cols = if cell_w > 0 { win_w / cell_w } else { 0 };
-  rows = if cell_h > 0 { win_h / cell_h } else { 0 };
+  // `?? 0` discharges the fallible `/` — under @PLN25 DN1 a division is typed
+  // `integer?` even behind the `> 0` guard, so returning it into the non-null
+  // `(integer, integer)` needs an explicit discharge (the branch keeps 0×0).
+  cols = if cell_w > 0 { win_w / cell_w ?? 0 } else { 0 };
+  rows = if cell_h > 0 { win_h / cell_h ?? 0 } else { 0 };
   (cols, rows)
 }
 
