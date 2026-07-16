@@ -637,8 +637,8 @@ fn scene_vt6(font: integer) -> Canvas {
 // --- Step 3: input encoding (events → PTY bytes; the reverse of term_feed) ---
 
 MOD_SHIFT = 1;
-MOD_ALT = 2;
-MOD_CTRL = 4;
+MOD_CTRL = 2;   // aligned to lib/graphics MOD_* so gl_event_mods() feeds encode_key directly
+MOD_ALT = 4;
 
 // A logical key press. `KChar` carries a resolved printable character (the
 // keycode→char mapping is the input layer's job); the rest are named keys.
@@ -840,6 +840,92 @@ fn run_conn(cfg: const Config, pass: text, setup: text, command: text, marker: t
   drain_into(s, t, marker, 5000);
   s.close();
   t
+}
+
+// 5.1 the live terminal app: a GL window driving the SSH shell. Interactive, so it
+// is verified by COMPILE here (both backends); the real run is manual (Step 5.4).
+
+// A graphics keycode → a Key. Named/control keys map by code (ENTER=13, BACKSPACE=8,
+// TAB=9, ESCAPE=27, arrows 128..131); anything else is a printable KChar.
+fn keycode_to_key(kc: integer) -> Key {
+  if kc == 13 { return KEnter; }
+  if kc == 8 { return KBackspace; }
+  if kc == 9 { return KTab; }
+  if kc == 27 { return KEsc; }
+  if kc == 128 { return KUp; }
+  if kc == 129 { return KDown; }
+  if kc == 130 { return KLeft; }
+  if kc == 131 { return KRight; }
+  return KChar { ch: kc as character };
+}
+
+fn send_mouse(t: const Term, s: Session, pressed: boolean, button: integer) {
+  out = encode_mouse(gl_event_x() as integer, gl_event_y() as integer,
+                     t.grid.cell_w, t.grid.cell_h, button, pressed, t.mouse_track, t.mouse_sgr);
+  if out.len() > 0 { s.send(out); }
+}
+
+// Translate one GL event → PTY bytes (keyboard / text / mouse) or a resize.
+fn handle_event(t: Term, s: Session, ev: integer) {
+  if ev == 3 {                                     // EV_TEXT — printable / IME text
+    txt = gl_event_text();
+    if txt.len() > 0 { s.send(txt); }
+  } else if ev == 1 {                              // EV_KEY_DOWN — named / modified keys
+    kc = gl_event_key();
+    mods = gl_event_mods();                        // lib/graphics MOD_* == our MOD_* now
+    // EV_TEXT already carries plain printables; here only send control / named keys.
+    if kc >= 128 or kc == 13 or kc == 8 or kc == 9 or kc == 27
+       or (mods & MOD_CTRL) != 0 or (mods & MOD_ALT) != 0 {
+      s.send(encode_key(keycode_to_key(kc), mods));
+    }
+  } else if ev == 4 { send_mouse(t, s, true, gl_event_button()); }   // EV_MOUSE_DOWN
+  else if ev == 5 { send_mouse(t, s, false, gl_event_button()); }    // EV_MOUSE_UP
+  else if ev == 7 {                                // EV_WHEEL — scroll (SGR wheel buttons)
+    btn = if gl_event_wheel() > 0 { 64 } else { 65 };
+    out = encode_mouse(gl_event_x() as integer, gl_event_y() as integer,
+                       t.grid.cell_w, t.grid.cell_h, btn, true, t.mouse_track, t.mouse_sgr);
+    if out.len() > 0 { s.send(out); }
+  } else if ev == 11 {                             // EV_RESIZE — reflow + tell the PTY
+    (rc, rr) = grid_cols_rows(gl_window_width(), gl_window_height(), t.grid.cell_w, t.grid.cell_h);
+    if rc > 0 and rr > 0 { s.resize(rc, rr); }     // (regridding the local buffer is a 5.4 refinement)
+  }
+}
+
+// Open a window, connect, auto-run the startup command, then pump input↔PTY↔screen.
+pub fn run_live(cfg: const Config, pass: text) {
+  font = gl_load_font(FONT);
+  if font < 0 { println("ssh_home: font load failed ({FONT})"); return; }
+  win_w = 480;
+  win_h = 800;                                     // a phone-ish portrait default
+  gl_create_window(win_w, win_h, "ssh_home");
+  painter = create_painter_2d(win_w as float, win_h as float);
+  t = term_new(make_grid_for_window(font, cfg.size, win_w, win_h));
+
+  s = ssh::connect(cfg.host, cfg.port);
+  if !s.ok() { println("ssh_home: connect failed"); gl_destroy_window(); return; }
+  if !s.login(cfg.user, pass) { println("ssh_home: login failed"); s.close(); gl_destroy_window(); return; }
+  if !s.open_shell("xterm-256color", t.grid.cols, t.grid.rows) {
+    println("ssh_home: open_shell failed"); s.close(); gl_destroy_window(); return;
+  }
+  s.send("{cfg.startup}\n");                        // auto-run the startup command (default `tmux attach`)
+
+  while s.is_open() {
+    gl_poll_events();
+    ev = gl_next_event();
+    while ev != 0 {                                // 0 == EV_NONE
+      handle_event(t, s, ev);
+      ev = gl_next_event();
+    }
+    out = s.recv();
+    if out.len() > 0 { term_feed(t, out); }        // PTY output → emulator
+    cv = render_grid(t.grid);                       // grid → Canvas → GL texture
+    tex = gl_upload_canvas(cv.data, cv.width, cv.height);
+    gl_clear(BG);
+    draw_texture_at(painter, tex, 0.0, 0.0, cv.width as float, cv.height as float);
+    gl_swap_buffers();
+  }
+  s.close();
+  gl_destroy_window();
 }
 
 fn main() {
@@ -1184,6 +1270,15 @@ fn main() {
     assert(term_cell_at(t, 0, 1).fg == ansi16(1));           // the SGR colour was applied
     assert(term_line_text(t, 2) == "plain");
     println("conntest: PASS");
+    return;
+  }
+
+  // Step 5.1 — the live app (interactive; run manually — Step 5.4).
+  //   main.loft x app [host=..] [port=42022] [user=..] [startup=..] [size=..]
+  //   password via $SSH_HOME_PW (the on-screen password path is a 5.4 refinement).
+  if scene_name == "app" {
+    live_cfg = parse_config(args, 2);
+    run_live(live_cfg, env_variable("SSH_HOME_PW"));
     return;
   }
 
