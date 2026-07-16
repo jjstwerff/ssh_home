@@ -134,6 +134,37 @@ surface, binary bytes via the NUL-safe `pack_*`/`byte_at` path.
   `Touch` + IME text); speech engine (whisper-FFI, or a thin JNI shim). Concrete
   library-addition designs: [docs/lib-gaps/](docs/lib-gaps/).
 
+## Step 7 — File transfer + directory browsing (SFTP; a natural later extension)
+
+Grabbing a file off the laptop onto the phone (a log, a photo, a document) and browsing
+the remote filesystem is the obvious next want once the terminal works. It composes
+cleanly onto everything above and needs **no redesign** — SSH multiplexes channels, so
+this is an **additive second channel on the same authenticated `Session`**; the shell
+keeps running untouched while a transfer proceeds.
+
+- **7.1 SFTP lib surface** — extend the `ssh` lib (an `ssh 0.2.0`, or a sibling
+  `loft-libs-net/sftp`) with an SFTP subsystem backed by `russh-sftp`: `open_sftp(session)`,
+  `list_dir(path) → entries` (name/size/mode/mtime), `read_file(path) → bytes` /
+  `write_file(path, bytes)`, `stat`, `mkdir` / `remove`. Reuses the existing connection +
+  auth + the binary-safe byte path (`byte_at`). **Verify (L):** against a mock/real SFTP —
+  `list_dir` returns the seeded entries; a **binary** download is byte-exact (sha vs the
+  source); upload + re-list round-trips.
+- **7.2 File browser — show project files** — render the remote directory listing in the
+  grid: tap to descend / `..` to ascend, a mode toggle (or swipe) between terminal ↔ files
+  so the tmux session stays live. **Verify (G+U):** a listing golden + the navigation model
+  (path stack, selection).
+- **7.3 File viewer — view them** — open a selected file (`read_file`) into a **scrollable
+  read-only pane**: text renders through the existing Grid/Canvas path (line-wrap + scroll,
+  no PTY needed); images (PNG/JPEG) via a `lib/graphics` decode, later. This is the heart of
+  the feature — glance at a config, a log, a source file on the phone without a shell dance.
+  **Verify (G):** a text-file view golden; **(U):** the wrap/scroll model.
+- **7.4 Download / upload to phone storage** — save a viewed/selected file locally
+  (byte-exact) and upload back; on Linux v1 "phone storage" is a config'd local dir.
+  **Verify (L):** sha round-trip.
+
+Out of scope for the shell-only `ssh 0.1.x` on purpose (YAGNI for the terminal); recorded
+here so Steps 4–6 stay compatible with it (they already are — one `Session`, many channels).
+
 ---
 
 ## Suggested first PR boundary
