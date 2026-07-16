@@ -149,16 +149,73 @@ wanted — they'd SFTP-`pread` the needed ranges instead of the whole image.
 - **Async behind a sync face** — like the shell channel, SFTP runs on the tokio runtime
   behind the same blocking/polling FFI; `content()` / `files()` block on the round-trip.
 
-## Implementation notes (Step 7.1)
+## Implementation — safe small steps
 
-- A **second SSH channel on the existing `Session`** (`russh` + `russh-sftp`), opened lazily
-  on the first file op — the shell channel is untouched, so tmux keeps running while you
-  browse or pull a file. One connection, one auth.
-- Native FFI mirrors the shell path: `n_sftp_list` / `n_sftp_read` / `n_sftp_write` /
-  `n_sftp_stat` behind the same `LoftStore` + byte-buffer marshaling as `send` / `recv` /
-  `byte_at` (binary-safe; `read_bytes` returns raw bytes read via `byte_at`).
-- Ships additively — an `ssh 0.2.0` (same crate) or a sibling `loft-libs-net/sftp` layered on
-  the `Session`. No change to the shell surface.
-- **Verify** as PLAN Step 7.1: (L) against a mock/real SFTP — `list_dir` returns seeded
-  entries; a **binary** download is byte-exact (sha vs source); upload + re-list round-trips;
-  and a `RemoteFile` walk prints the same shape a native `File` walk would.
+**Architecture.** One **additive** capability: a second SSH channel on the *existing*
+authenticated `Session` (`russh` + `russh-sftp`), opened lazily on the first file op. Native
+FFI mirrors the shell path — `n_sftp_open` / `n_sftp_list` / `n_sftp_read` / `n_sftp_write` /
+`n_sftp_stat` / `n_sftp_mkdir` / … behind the same `LoftStore` + byte-buffer marshaling as
+`send` / `recv` / `byte_at` (binary-safe; `read_bytes` returns raw bytes via `byte_at`). Ships
+as `ssh 0.2.0` (same crate) or a sibling `loft-libs-net/sftp`.
+
+**What makes the steps *safe*.** Every step is: (a) **additive** — a new symbol, and the shell
+surface (`ssh 0.1.x`) is never edited; (b) **independently verified** before the next is begun;
+(c) **deterministic** — a seeded mock SFTP tree + golden images, no clocks; (d) small and
+reversible. Two gates recur at every lib step:
+- **shell-still-green** — re-run the `ssh 0.1.x` live smoke (PLAN Step 4) after each lib step; the
+  terminal must be provably unbroken (this is the whole point of "additive").
+- **interpret == native** — the step passes on both backends. (No `--html`: a browser has no raw
+  socket — § top. And `--native` needs the P269 install fix — see routing's `loft-feedback.md`.)
+
+Verification legend as in [PLAN.md](../PLAN.md): **(U)** unit · **(G)** golden PNG · **(L)** live.
+
+### Phase A — the lib (native `File` mirror over SFTP)
+
+- **A0 — Mock SFTP + harness (fail first).** Extend `tools/mock_sshd.py` with paramiko's
+  `SFTPServer` over a seeded tree: a text file, a binary file (with NUL bytes), a subdir, and a
+  small loft store. **(L):** the harness opens the SFTP subsystem; a wrong path errors cleanly —
+  prove it can *fail* before trusting it.
+- **A1 — Open the channel (shell untouched).** `open_sftp(self: Session)` opens the second
+  channel lazily. **(L):** with a shell open *and echoing*, open SFTP; assert the shell still
+  echoes AND SFTP is open — the **shell-still-green** gate, first proof the design is additive.
+- **A2 — List a directory.** `s.list_dir(path) -> vector<text>?` and `s.file(path).files() ->
+  vector<RemoteFile>` (path/size/format from the SFTP stat). **(L):** the seeded dir → the exact
+  entries; a missing dir → `null`; a file → `NotDirectory`. **(U):** the `RemoteFile` fields
+  populate.
+- **A3 — Read text.** `sel.content() -> text?` / `sel.lines()` via `n_sftp_read`. **(L):** a
+  seeded text file → byte-exact content; a missing file → `null`.
+- **A4 — Read binary + format sniff.** `sel.read_bytes() -> vector<u8>?` (raw, NUL-safe);
+  `format` set on open by the extension + a NUL/UTF-8 sniff. **(L):** a binary file (with NULs)
+  downloads **byte-exact** (sha vs source); its `format` is binary, a text file's is `TextFile`.
+- **A5 — Write + mutate.** `write` / `write_bytes` / `mkdir` / `delete` / `move` → `FileResult`.
+  **(L):** write→re-read matches; mkdir→list shows it; move→re-list; delete→gone; each returns the
+  right `FileResult`.
+- **A6 — `store_load` over SFTP (no mmap).** `s.store_load(r, path)` fetches the remote image and
+  decodes via the non-mmap reader. **(L):** `store_load` a seeded remote store; a known-record
+  query matches the *same store loaded locally* — mmap never involved.
+- **A7 — Parity gate + publish.** Full lib suite on `--interpret` **and** `--native`; the
+  `ssh 0.1.x` smoke still green (no regression). Publish `ssh 0.2.0` / the `sftp` lib. **Verify:**
+  interpret == native; the shell surface is unchanged.
+
+### Phase B — the app (browser + viewer)
+
+- **B0 — Browser model (pure).** cwd + entries (`s.file(cwd).files()`) + selection + path stack;
+  descend / `..` / select. **(U):** the navigation model against a seeded listing.
+- **B1 — Browser render.** Listing → Grid: dirs vs files, a size column, selection via SGR
+  reverse. **(G):** a listing golden. **(U):** entries → cells.
+- **B2 — Text viewer.** Open a text file → a scrollable pane (reuse the Grid + line-wrap + the
+  scroll model). **(G):** a text-view golden. **(U):** the wrap/scroll model.
+- **B3 — Binary / image viewer.** Image `format` → decode via `lib/graphics` + render; else a
+  hex/size summary. **(G):** an image-view golden (a seeded small PNG); a non-image binary → a hex
+  golden.
+- **B4 — Download / upload to phone storage.** A selected file's `read_bytes()` → local storage
+  (byte-exact); upload reads local → `write_bytes`. Linux v1: a config'd local dir. **(L):** an sha
+  round-trip.
+- **B5 — Mode toggle + wire into the app loop.** A terminal ↔ files toggle (gesture/key) so tmux
+  stays live while browsing; fold the browser/viewer into the Step 5 loop. **(G+L):** switch to
+  files → browse → view → back to terminal, with the tmux session unaffected (a key frame after
+  each transition).
+
+**First reviewable slice: A0–A2** (mock + additive channel + listing) — it stands up the whole
+verification story and proves the shell-still-green gate before any read / write / render, exactly
+as Steps 0–1 did for the main app.
