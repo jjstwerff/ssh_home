@@ -63,6 +63,11 @@ class Server(paramiko.ServerInterface):
 def serve_channel(chan, server):
     server.shell_ready.wait(10)
     master_fd, slave_fd = pty.openpty()
+    # Deterministic test output: turn off input echo on the PTY so a caller reads
+    # only command OUTPUT (no echoed command line, no readline meta-handling races).
+    attrs = termios.tcgetattr(slave_fd)
+    attrs[3] &= ~termios.ECHO          # lflags &= ~ECHO
+    termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
     server.master_fd = master_fd
     server._set_winsize()
     env = {**os.environ, "PS1": "$ ", "TERM": "xterm", "HISTFILE": "/dev/null"}

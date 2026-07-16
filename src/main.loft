@@ -12,6 +12,7 @@
 //
 //   loft src/main.loft /abs/out.png [clear|ready|grid]
 use graphics;
+use ssh;
 
 FONT = "../fonts/DejaVuSansMono.ttf";   // relative to the source dir (src/)
 BG = 0xFF101820;                         // default background (0xAARRGGBB)
@@ -767,6 +768,80 @@ fn render(scene_name: text) -> Canvas {
   cv
 }
 
+// --- Step 5: Linux v1 integration — config + the SSH-driven loop ---
+
+// 5.3 config — host / port / user / startup command / font size, from `key=value` args.
+struct Config {
+  host: text,
+  port: integer,
+  user: text,
+  startup: text,   // auto-run on connect (default `tmux attach` → the latest session)
+  size: float,     // default font size
+}
+
+pub fn default_config() -> Config {
+  Config { host: "127.0.0.1", port: 42022, user: "", startup: "tmux attach", size: 18.0 }
+}
+
+// Overlay `key=value` args on the defaults; a value may contain `=` (rejoined);
+// unknown keys and malformed args are ignored.
+pub fn parse_config(args: vector<text>, start: integer) -> Config {
+  cfg = default_config();
+  for i in start..len(args) {
+    kv = args[i] ?? "";
+    parts = kv.split('=');
+    if len(parts) >= 2 {
+      key = parts[0] ?? "";
+      val = parts[1] ?? "";
+      for j in 2..len(parts) { p = parts[j] ?? ""; val = "{val}={p}"; }   // rejoin `=` in values
+      if key == "host" { cfg.host = val; }
+      else if key == "port" { cfg.port = val as integer ?? cfg.port; }
+      else if key == "user" { cfg.user = val; }
+      else if key == "startup" { cfg.startup = val; }
+      else if key == "size" { cfg.size = val as float ?? cfg.size; }
+    }
+  }
+  cfg
+}
+
+// 5.2 integration — drive an SSH shell and feed its bytes into the emulator.
+
+// Poll recv, feeding each chunk into the emulator, until `marker` appears or timeout.
+fn drain_into(s: Session, t: Term, marker: text, timeout_ms: integer) {
+  start = now();
+  acc = "";
+  while now() - start < timeout_ms {
+    chunk = s.recv();
+    if chunk.len() > 0 {
+      term_feed(t, chunk);
+      acc = "{acc}{chunk}";
+      if marker.len() > 0 and acc.contains(marker) { return; }
+    }
+  }
+}
+
+fn drain_discard(s: Session, timeout_ms: integer) {
+  start = now();
+  while now() - start < timeout_ms { s.recv(); }
+}
+
+// Connect + login + shell, run an optional `setup` (drained + discarded), then feed
+// `command`'s output into a fresh Term until `marker`. Headless — proves the pipeline
+// SSH bytes → term_feed → grid. A failed connect/login/shell returns a blank Term.
+fn run_conn(cfg: const Config, pass: text, setup: text, command: text, marker: text,
+            cols: integer, rows: integer) -> Term {
+  t = term_new(make_grid_bare(cols, rows));
+  s = ssh::connect(cfg.host, cfg.port);
+  if !s.ok() { return t; }
+  if !s.login(cfg.user, pass) { s.close(); return t; }
+  if !s.open_shell("xterm-256color", cols, rows) { s.close(); return t; }
+  if setup.len() > 0 { s.send(setup); drain_discard(s, 700); }
+  s.send(command);
+  drain_into(s, t, marker, 5000);
+  s.close();
+  t
+}
+
 fn main() {
   args = arguments();
   if len(args) == 0 {
@@ -1073,6 +1148,42 @@ fn main() {
     (cb, rb) = grid_cols_rows(320, 240, 16, 32);   // big cells → fewer
     assert(cb < cs and rb < rs);
     println("inputtest: PASS");
+    return;
+  }
+
+  // (U) Step 5.3 — config parsing.
+  if scene_name == "configtest" {
+    cfg_d = default_config();
+    assert(cfg_d.port == 42022 and cfg_d.startup == "tmux attach" and cfg_d.host == "127.0.0.1");
+    cfg_a = parse_config(["host=lap.local", "port=2222", "user=me", "startup=htop -d 5", "size=24.0"], 0);
+    assert(cfg_a.host == "lap.local" and cfg_a.port == 2222 and cfg_a.user == "me");
+    assert(cfg_a.startup == "htop -d 5" and cfg_a.size == 24.0);
+    cfg_b = parse_config(["garbage", "nope", "port=5"], 0);
+    assert(cfg_b.port == 5 and cfg_b.host == "127.0.0.1");   // malformed ignored, default host kept
+    cfg_c = parse_config(["startup=export A=1; tmux"], 0);
+    assert(cfg_c.startup == "export A=1; tmux");              // `=` in the value preserved
+    println("configtest: PASS");
+    return;
+  }
+
+  // (L) Step 5.2 — integration: SSH shell → emulator → grid (needs a running sshd).
+  //   usage: main.loft <out> conntest <host> <port> <user> <pass>
+  if scene_name == "conntest" {
+    cfg = default_config();
+    cfg.host = args[2] ?? "127.0.0.1";
+    cfg.port = (args[3] ?? "42022") as integer ?? 42022;
+    cfg.user = args[4] ?? "testuser";
+    pass = args[5] ?? "testpass";
+    // printf's `\033` → real ESC in the OUTPUT (sent as literal `\033`, not a raw ESC,
+    // so bash's line reader passes it through); the mock PTY has echo off, so only this
+    // deterministic coloured frame reaches us — not the command line.
+    cmd = "printf '\\033[2J\\033[H== term ==\\033[2;1H\\033[31mRED\\033[0m\\033[3;1Hplain\\033[12;1H__SSHDONE__'\n";
+    t = run_conn(cfg, pass, "", cmd, "__SSHDONE__", 40, 12);
+    assert(term_line_text(t, 0) == "== term ==");            // frame text arrived + parsed
+    assert(term_line_text(t, 1) == "RED");
+    assert(term_cell_at(t, 0, 1).fg == ansi16(1));           // the SGR colour was applied
+    assert(term_line_text(t, 2) == "plain");
+    println("conntest: PASS");
     return;
   }
 
