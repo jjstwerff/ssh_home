@@ -142,13 +142,20 @@ cleanly onto everything above and needs **no redesign** — SSH multiplexes chan
 this is an **additive second channel on the same authenticated `Session`**; the shell
 keeps running untouched while a transfer proceeds.
 
-- **7.1 SFTP lib surface** — extend the `ssh` lib (an `ssh 0.2.0`, or a sibling
-  `loft-libs-net/sftp`) with an SFTP subsystem backed by `russh-sftp`: `open_sftp(session)`,
-  `list_dir(path) → entries` (name/size/mode/mtime), `read_file(path) → bytes` /
-  `write_file(path, bytes)`, `stat`, `mkdir` / `remove`. Reuses the existing connection +
-  auth + the binary-safe byte path (`byte_at`). **Verify (L):** against a mock/real SFTP —
-  `list_dir` returns the seeded entries; a **binary** download is byte-exact (sha vs the
-  source); upload + re-list round-trips.
+- **7.1 SFTP lib surface — mirror loft's native `File`** (full spec:
+  [docs/sftp-file-api.md](docs/sftp-file-api.md)). Extend the `ssh` lib (an `ssh 0.2.0`, or a
+  sibling `loft-libs-net/sftp`) with an SFTP subsystem backed by `russh-sftp`, shaped **1:1 on
+  the stdlib file API**: reuse `Format` / `FileResult`; a `RemoteFile` (path/size/format/session)
+  with `content()` / `lines()` / `read_bytes()` / `files()` / `write()` / `exists()`; `s.file(path)`
+  the sole shape delta vs native `file(path)`; `Session` methods mirror the path free-fns
+  (`list_dir` / `read_bytes` / `mkdir` / `move` / `mtime`); path-text helpers (`join`/`dir`/
+  `basename`) are shared unchanged. **Binary vs text is `Format`-driven** (`content()` text,
+  `read_bytes()` binary — sniffed on open, never by transport). A remote loft **store** loads via
+  the non-mmap `s.store_load(r, path)` (mmap / `store_persist_bind` can't cross SFTP; the
+  byte-decode reader — same one the browser store-app uses over HTTP — can). Additive: a second
+  channel on the existing `Session`, shell untouched. **Verify (L):** a `RemoteFile` walk prints
+  the same shape a native `File` walk would; a **binary** download is byte-exact (sha vs source);
+  upload + re-list round-trips; `store_load` of a remote image queries identically to a local one.
 - **7.2 File browser — show project files** — render the remote directory listing in the
   grid: tap to descend / `..` to ascend, a mode toggle (or swipe) between terminal ↔ files
   so the tmux session stays live. **Verify (G+U):** a listing golden + the navigation model
