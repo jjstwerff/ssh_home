@@ -633,6 +633,98 @@ fn scene_vt6(font: integer) -> Canvas {
   render_grid(t.grid)
 }
 
+// --- Step 3: input encoding (events → PTY bytes; the reverse of term_feed) ---
+
+MOD_SHIFT = 1;
+MOD_ALT = 2;
+MOD_CTRL = 4;
+
+// A logical key press. `KChar` carries a resolved printable character (the
+// keycode→char mapping is the input layer's job); the rest are named keys.
+enum Key {
+  KChar { ch: character },
+  KEnter, KBackspace, KTab, KEsc,
+  KUp, KDown, KRight, KLeft,
+  KHome, KEnd, KPageUp, KPageDown, KInsert, KDelete,
+}
+
+// --- 3.1 keyboard → PTY bytes ---
+
+// The control byte for Ctrl+<key>: letters → 1..26, space/@ → 0 (NUL),
+// [ \ ] ^ _ → 0x1B..0x1F; -1 if the key has no control form.
+fn ctrl_byte(cp: integer) -> integer {
+  if cp >= 0x61 and cp <= 0x7A { return cp - 0x60; }   // a-z → 1..26
+  if cp >= 0x41 and cp <= 0x5A { return cp - 0x40; }   // A-Z → 1..26
+  if cp == 0x20 or cp == 0x40 { return 0; }            // space / @ → NUL
+  if cp >= 0x5B and cp <= 0x5F { return cp - 0x40; }   // [ \ ] ^ _ → 0x1B..0x1F
+  -1
+}
+
+fn encode_char(ch: character, ctrl: boolean) -> text {
+  if ctrl {
+    ctl = ctrl_byte(ch as integer);
+    if ctl >= 0 { return "{ctl as character}"; }
+  }
+  "{ch}"
+}
+
+// Encode a key press to the bytes a terminal sends the PTY. Arrows use normal (not
+// application) cursor mode; Alt/Meta prefixes the sequence with ESC.
+pub fn encode_key(key: Key, mods: integer) -> text {
+  esc = 27 as character;
+  ctrl = (mods & MOD_CTRL) != 0;
+  base = match key {
+    KChar { ch } => encode_char(ch, ctrl),
+    KEnter => "\r",
+    KBackspace => "{127 as character}",   // DEL (xterm default)
+    KTab => "\t",
+    KEsc => "{esc}",
+    KUp => "{esc}[A",
+    KDown => "{esc}[B",
+    KRight => "{esc}[C",
+    KLeft => "{esc}[D",
+    KHome => "{esc}[H",
+    KEnd => "{esc}[F",
+    KPageUp => "{esc}[5~",
+    KPageDown => "{esc}[6~",
+    KInsert => "{esc}[2~",
+    KDelete => "{esc}[3~",
+  };
+  if (mods & MOD_ALT) != 0 { "{esc}{base}" } else { base }
+}
+
+// --- 3.2 mouse → SGR (gated by the 2.5 tracking latches) ---
+
+// Encode a mouse event to the bytes tmux expects — GATED by the tracking mode from
+// ?1000/1002/1003. Off → nothing. SGR (?1006) → `ESC[<b;col;row M/m`; otherwise the
+// legacy X10 encoding. `button`: 0/1/2 = L/M/R, 64/65 = wheel up/down.
+pub fn encode_mouse(px: integer, py: integer, cell_w: integer, cell_h: integer,
+                    button: integer, pressed: boolean,
+                    mouse_track: integer, mouse_sgr: boolean) -> text {
+  if mouse_track == 0 { return ""; }
+  col = (px / cell_w ?? 0) + 1;        // 1-based cell coordinates
+  row = (py / cell_h ?? 0) + 1;
+  esc = 27 as character;
+  if mouse_sgr {
+    fin = if pressed { "M" } else { "m" };
+    return "{esc}[<{button};{col};{row}{fin}";
+  }
+  // legacy X10/1000: ESC [ M <b+32> <col+32> <row+32>; a release is button 3.
+  b = if pressed { button } else { 3 };
+  "{esc}[M{(b + 32) as character}{(col + 32) as character}{(row + 32) as character}"
+}
+
+// --- 3.3 zoom → resize ---
+
+// A zoom step scales the font size (Ctrl+wheel / pinch), clamped to a readable
+// range. The caller re-derives cols×rows via make_grid_for_window and sends a PTY
+// resize (Step 4). dir > 0 zooms in, dir <= 0 zooms out. (fita/fitb are the
+// two-zoom-level render goldens.)
+pub fn zoom_step(size: float, dir: integer) -> float {
+  ns = if dir > 0 { size * 1.25 } else { size * 0.8 };
+  if ns < 8.0 { 8.0 } else if ns > 72.0 { 72.0 } else { ns }
+}
+
 fn render(scene_name: text) -> Canvas {
   if scene_name == "clear" {
     return canvas(256, 192, BG);
@@ -937,6 +1029,50 @@ fn main() {
     assert((term_cell_at(t, 0, 6).attrs & ATTR_REV) != 0);
     assert((term_cell_at(t, 0, 0).attrs & ATTR_REV) == 0);
     println("vttest6: PASS");
+    return;
+  }
+
+  // (U) Step 3 input encoding — keyboard→PTY bytes, mouse→SGR, zoom→resize.
+  if scene_name == "inputtest" {
+    esc = 27 as character;
+    del = 127 as character;
+
+    // 3.1 keyboard
+    assert(encode_key(KChar { ch: 'a' }, 0) == "a");
+    assert(encode_key(KChar { ch: 'A' }, MOD_SHIFT) == "A");                 // shift already in the char
+    assert(encode_key(KChar { ch: 'a' }, MOD_CTRL) == "{1 as character}");   // Ctrl+A = 0x01
+    assert(encode_key(KChar { ch: 'c' }, MOD_CTRL) == "{3 as character}");   // Ctrl+C = 0x03
+    assert(encode_key(KEnter, 0) == "\r");
+    assert(encode_key(KBackspace, 0) == "{del}");                            // DEL
+    assert(encode_key(KTab, 0) == "\t");
+    assert(encode_key(KEsc, 0) == "{esc}");
+    assert(encode_key(KUp, 0) == "{esc}[A");
+    assert(encode_key(KDown, 0) == "{esc}[B");
+    assert(encode_key(KRight, 0) == "{esc}[C");
+    assert(encode_key(KLeft, 0) == "{esc}[D");
+    assert(encode_key(KHome, 0) == "{esc}[H");
+    assert(encode_key(KPageUp, 0) == "{esc}[5~");
+    assert(encode_key(KDelete, 0) == "{esc}[3~");
+    assert(encode_key(KChar { ch: 'x' }, MOD_ALT) == "{esc}x");              // Alt prefixes ESC
+    assert(encode_key(KChar { ch: 'b' }, MOD_CTRL | MOD_ALT) == "{esc}{2 as character}");
+
+    // 3.2 mouse (gated); cell 10x20, pixel (50,30) → col 6, row 2
+    assert(encode_mouse(50, 30, 10, 20, 0, true, 0, false) == "");           // tracking off → nothing
+    assert(encode_mouse(50, 30, 10, 20, 0, true, 1002, true) == "{esc}[<0;6;2M");   // SGR press
+    assert(encode_mouse(50, 30, 10, 20, 0, false, 1002, true) == "{esc}[<0;6;2m");  // SGR release
+    assert(encode_mouse(0, 0, 10, 20, 64, true, 1002, true) == "{esc}[<64;1;1M");   // wheel up
+    // legacy X10: ESC [ M <0+32> <6+32> <2+32>
+    assert(encode_mouse(50, 30, 10, 20, 0, true, 1000, false)
+           == "{esc}[M{32 as character}{38 as character}{34 as character}");
+
+    // 3.3 zoom → resize
+    assert(zoom_step(18.0, 1) > 18.0 and zoom_step(18.0, -1) < 18.0);
+    assert(zoom_step(70.0, 1) == 72.0);   // clamp high (70*1.25 = 87.5)
+    assert(zoom_step(9.0, -1) == 8.0);    // clamp low  (9*0.8 = 7.2)
+    (cs, rs) = grid_cols_rows(320, 240, 8, 16);    // small cells → more cells
+    (cb, rb) = grid_cols_rows(320, 240, 16, 32);   // big cells → fewer
+    assert(cb < cs and rb < rs);
+    println("inputtest: PASS");
     return;
   }
 
