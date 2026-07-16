@@ -14,3 +14,7 @@ loft = ">=0.8"
 # loft 2026.7.1 warning cleanup (retired `not null` removed, sqrt `float?` and the
 # group_vbos `&` params discharged) so consuming it stays warning-free.
 graphics = ">=0.4.2"
+# ssh 0.1.0: the russh transport (connect/login/open_shell/send/recv/resize/close).
+# Used by tools/ssh_smoke.loft (Step 4 live test); wired into the app loop in Step 5.
+# main.loft does NOT import ssh yet, so the golden/unit runs don't build its cdylib.
+ssh = ">=0.1.0"

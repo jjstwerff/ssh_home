@@ -1,0 +1,90 @@
+// Copyright (c) 2026 Jurjen Stellingwerff
+// SPDX-License-Identifier: LGPL-3.0-or-later
+//
+// Step 4 — live SSH transport smoke test. Drives the published `ssh` lib against a
+// running sshd (tools/mock_sshd.py, or a real one) and asserts the whole transport:
+// connect, password auth + rejection, a real shell, a binary round-trip (raw ESC
+// survives the FFI), and resize propagation.
+//
+//   loft tools/ssh_smoke.loft [host] [port] [user] [pass]
+use ssh;
+
+// Poll the non-blocking recv until `needle` appears or the deadline passes.
+fn recv_until(s: Session, needle: text, timeout_ms: integer) -> text {
+  start = now();
+  acc = "";
+  while now() - start < timeout_ms {
+    chunk = s.recv();
+    if chunk.len() > 0 {
+      acc = "{acc}{chunk}";
+      if acc.contains(needle) { return acc; }
+    }
+  }
+  acc
+}
+
+// Poll until a byte equal to `target` appears (needed for the binary test: the
+// echoed command carries a literal `\033`, but only printf's OUTPUT is a real ESC).
+fn recv_until_byte(s: Session, target: integer, timeout_ms: integer) -> text {
+  start = now();
+  acc = "";
+  while now() - start < timeout_ms {
+    chunk = s.recv();
+    if chunk.len() > 0 {
+      acc = "{acc}{chunk}";
+      for i in 0..acc.len() {
+        if ssh::byte_at(i, acc) == target { return acc; }
+      }
+    }
+  }
+  acc
+}
+
+fn main() {
+  args = arguments();
+  host = args[0] ?? "127.0.0.1";
+  port = (args[1] ?? "42022") as integer ?? 42022;
+  user = args[2] ?? "testuser";
+  pass = args[3] ?? "testpass";
+  println("ssh_smoke → {host}:{port} as {user}");
+
+  // 4.1 negative: a wrong password must be rejected (no valid creds needed).
+  neg = ssh::connect(host, port);
+  assert(neg.ok(), "connect (negative)");
+  assert(!neg.login(user, "definitely-wrong"), "wrong password must be rejected");
+  neg.close();
+  println("  auth rejection: ok");
+
+  // 4.1 positive: connect + auth + shell.
+  s = ssh::connect(host, port);
+  assert(s.ok(), "connect");
+  assert(s.login(user, pass), "login");
+  assert(s.open_shell("xterm", 80, 24), "open_shell");
+  println("  connect + login + shell: ok");
+
+  // 4.1 echo marker round-trip.
+  s.send("echo LOFT_OK\n");
+  out = recv_until(s, "LOFT_OK", 4000);
+  assert(out.contains("LOFT_OK"), "echo marker not seen");
+  println("  echo marker: ok");
+
+  // 4.2 binary round-trip — printf emits a raw ESC (0x1B); it must survive the FFI.
+  s.send("printf 'X\\033Y\\n'\n");
+  bin = recv_until_byte(s, 27, 4000);
+  esc_seen = false;
+  for i in 0..bin.len() {
+    if ssh::byte_at(i, bin) == 27 { esc_seen = true; }
+  }
+  assert(esc_seen, "raw ESC byte (0x1B) did not survive the transport");
+  println("  binary ESC round-trip: ok");
+
+  // 4.3 resize → remote `stty size` reports the new dims (rows cols).
+  s.resize(100, 40);
+  s.send("stty size\n");
+  dims = recv_until(s, "40 100", 4000);
+  assert(dims.contains("40 100"), "resize did not propagate (stty size)");
+  println("  resize propagation: ok");
+
+  s.close();
+  println("sshtest: PASS");
+}
