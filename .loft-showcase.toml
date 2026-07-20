@@ -1,0 +1,4 @@
+# Featured as a loft build example in the "state of the loft distribution" overview
+# (loft-lang/loft @PLN112). Edit here — this repo owns its showcase blurb.
+[[showcase]]
+demonstrates = "a native terminal app — SSH + PTY, phone-width tmux, no browser"
